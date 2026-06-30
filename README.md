@@ -25,6 +25,8 @@ A bash script that downloads and updates the Project Ebonhold game client on Lin
 
 ## Usage
 
+Copy the script to your Ebhonhold client directory  
+
 ### Make it executable
 ```bash
 chmod +x updater.sh
