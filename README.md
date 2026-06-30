@@ -36,5 +36,5 @@ or
 ## Credits
 
 This script is a **simplified fork** of sigboe/ebhonhold-updater for Project Ebonhold.  
-**Original script:** ([sigboe/ebonhold-updater](https://github.com/sigboe/ebonhold-updater)) by **Sigboe**  
-Special thanks to the developers and community who reverse‑engineered the API and made the Linux port possible.  
+**Original script:** ([sigboe/ebonhold-updater](https://github.com/sigboe/ebonhold-updater)) by **Sigboe**.  
+Thanks to Sigboe for the original script.
