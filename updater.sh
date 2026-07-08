@@ -4,12 +4,12 @@
 : "${game:=roguelike-prod}"
 
 scriptdir="$(dirname "$(readlink -f "${0}")")"
-targetdir="${scriptdir}"
+targetdir="${PWD}"
 
 login_api="https://api.project-ebonhold.com/api/auth/login"
 manifest_api="https://api.project-ebonhold.com/api/launcher/file-hashes?server_name=roguelike-prod"
 patch_download_base="https://api.project-ebonhold.com/api/launcher/download?file_ids="
-token_file="${scriptdir}/.updaterToken"
+token_file="${targetdir}/.updaterToken"
 
 declare -A PATCH_IDS=(
   ["patch-4"]="191"
@@ -98,6 +98,7 @@ manage_token() {
     error 1 "Failed to fetch manifest with new token. Please try again."
   fi
 
+  unset user pass
   authToken="${token}"
   manifest="${manifest_response}"
   debug "Authentication successful."
@@ -180,55 +181,68 @@ format_bytes() {
 download_file_by_id() {
   local file_id="$1"
   local dest_path="$2"
-  local pass_token="$3"
-  local description="${4:-$dest_path}"
+  local description="${3:-$dest_path}"
+  local retry=0
+  local max_retries=1
 
   debug "Downloading file ID ${file_id} -> ${dest_path}"
 
-  tmp_out="$(mktemp)"
-  status="$(curl -s -w "%{http_code}" -o "${tmp_out}" \
-    -H "Authorization: Bearer ${pass_token}" \
-    -H "User-Agent: EbonholdLauncher/1.0" \
-    -H "Accept: application/json" \
-    -H "X-Client-Id: EbonholdLauncher" \
-    -H "Origin: https://project-ebonhold.com" \
-    -H "Referer: https://project-ebonhold.com/download" \
-    "${patch_download_base}${file_id}" 2>/dev/null)"
-  response="$(<"${tmp_out}")"
-  rm -f "${tmp_out}"
+  while [[ $retry -le $max_retries ]]; do
+    tmp_out="$(mktemp)"
+    status="$(curl -s -w "%{http_code}" -o "${tmp_out}" \
+      -H "Authorization: Bearer ${authToken}" \
+      -H "User-Agent: EbonholdLauncher/1.0" \
+      -H "Accept: application/json" \
+      -H "X-Client-Id: EbonholdLauncher" \
+      -H "Origin: https://project-ebonhold.com" \
+      -H "Referer: https://project-ebonhold.com/download" \
+      "${patch_download_base}${file_id}" 2>/dev/null)"
+    response="$(<"${tmp_out}")"
+    rm -f "${tmp_out}"
 
-  if [[ "${status}" != "200" ]]; then
-    echo -e "${RED}[ERROR]${NC} Failed to get download URL for ID ${file_id} (HTTP ${status})"
-    echo "Server response:"
-    echo "${response}" | jq . 2>/dev/null || echo "${response}"
-    return 1
-  fi
+    if [[ "${status}" != "200" ]]; then
+      if [[ "${status}" == "401" && $retry -lt $max_retries ]]; then
+        debug "Token rejected (401). Re‑authenticating..."
+        rm -f "${token_file}"
+        manage_token # updates global authToken
+        ((retry++))
+        debug "Retry ${retry}/${max_retries} with new token."
+        continue
+      fi
+      echo -e "${RED}[ERROR]${NC} Failed to get download URL for ID ${file_id} (HTTP ${status})"
+      echo "Server response:"
+      echo "${response}" | jq . 2>/dev/null || echo "${response}"
+      return 1
+    fi
 
-  url="$(jq --raw-output '.files[0].url' <<<"${response}" 2>/dev/null)"
-  if [[ -z "${url}" || "${url}" == "null" ]]; then
-    url="$(jq --raw-output '.url' <<<"${response}" 2>/dev/null)"
-  fi
-  if [[ -z "${url}" || "${url}" == "null" ]]; then
-    echo -e "${RED}[ERROR]${NC} No download URL found for ID ${file_id}"
-    return 1
-  fi
+    url="$(jq --raw-output '.files[0].url' <<<"${response}" 2>/dev/null)"
+    if [[ -z "${url}" || "${url}" == "null" ]]; then
+      url="$(jq --raw-output '.url' <<<"${response}" 2>/dev/null)"
+    fi
+    if [[ -z "${url}" || "${url}" == "null" ]]; then
+      echo -e "${RED}[ERROR]${NC} No download URL found for ID ${file_id}"
+      return 1
+    fi
 
-  debug "Download URL: ${url}"
-  mkdir -p "$(dirname "${dest_path}")"
+    debug "Download URL: ${url}"
+    mkdir -p "$(dirname "${dest_path}")"
 
-  echo -e "${BLUE}[DOWNLOADING]${NC} ${description}..."
-  if ! curl -fL# "${url}" -o "${dest_path}"; then
-    echo -e "${RED}[ERROR]${NC} Failed to download ${description}"
-    return 1
-  fi
+    echo -e "${BLUE}[DOWNLOADING]${NC} ${description}..."
+    if ! curl -fL# "${url}" -o "${dest_path}"; then
+      echo -e "${RED}[ERROR]${NC} Failed to download ${description}"
+      return 1
+    fi
 
-  local size="$(stat -c%s "${dest_path}" 2>/dev/null || echo "0")"
-  echo -e "${GREEN}[FINISHED]${NC} ${description} ($(format_bytes ${size}))\n"
-  return 0
+    local size="$(stat -c%s "${dest_path}" 2>/dev/null || echo "0")"
+    echo -e "${GREEN}[FINISHED]${NC} ${description} ($(format_bytes ${size}))\n"
+    return 0
+  done
+
+  echo -e "${RED}[ERROR]${NC} Still getting 401 after re‑authentication. Please try again."
+  return 1
 }
 
 download_extra_files() {
-  local pass_token="$1"
   local any_failed=0
 
   for file_path in "${!EXTRA_FILES[@]}"; do
@@ -238,7 +252,7 @@ download_extra_files() {
       debug "Extra file ${file_path} already exists, skipping."
       continue
     fi
-    if ! download_file_by_id "$id" "$dest" "$pass_token" "$file_path"; then
+    if ! download_file_by_id "$id" "$dest" "$file_path"; then
       any_failed=1
     fi
   done
@@ -248,7 +262,6 @@ download_extra_files() {
 
 update_manifest_patches() {
   local patches_json="$1"
-  local pass_token="$2"
 
   local patch_name b64_hash expected_md5 local_md5 file_path
   local numeric_id
@@ -293,7 +306,7 @@ update_manifest_patches() {
       if [[ -z "${numeric_id}" ]]; then
         error 1 "No numeric ID known for ${patch_name}. Please add to PATCH_IDS."
       fi
-      if download_file_by_id "$numeric_id" "${targetdir}/${file_path}" "$pass_token" "$patch_name"; then
+      if download_file_by_id "$numeric_id" "${targetdir}/${file_path}" "$patch_name"; then
         current_size="$(stat -c%s "${targetdir}/${file_path}")"
         size_downloaded=$((size_downloaded + current_size))
         [[ -d "${targetdir}/Cache" ]] && touch "${targetdir}/Cache/invalid"
@@ -369,9 +382,8 @@ if [[ -z "${authToken}" || "${authToken}" == "null" ]]; then
   error 1 "Authentication token is missing. Please log in again."
 fi
 
-update_manifest_patches "${patch_map}" "${authToken}"
-
-download_extra_files "${authToken}"
+update_manifest_patches "${patch_map}"
+download_extra_files
 
 [[ -f "${targetdir}/Cache/invalid" ]] || [ -d "${targetdir}/Cache" ] && clearCache
 
