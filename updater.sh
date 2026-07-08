@@ -25,14 +25,83 @@ declare -A EXTRA_FILES=(
   ["skia.dll"]="204"
   ["ebonhold.dll"]="205"
 )
-# ----------------------------------------------------------------------
 
-if [[ -f "${token_file}" ]]; then
-  authToken="$(<"${token_file}")"
-  if [[ -z "${authToken}" || "${authToken}" == "null" ]]; then
-    unset authToken
+manage_token() {
+  local token=""
+  local manifest_response=""
+  local user=""
+  local pass=""
+
+  if [[ -f "${token_file}" ]]; then
+    token="$(<"${token_file}")"
+    if [[ -z "${token}" || "${token}" == "null" ]]; then
+      debug "Token file exists but is empty or contains 'null'. Clearing it."
+      rm -f "${token_file}"
+      token=""
+    fi
   fi
-fi
+
+  if [[ -n "${token}" ]]; then
+    debug "Auth token found, verifying token."
+    manifest_response="$(curl -s -H "Authorization: Bearer ${token}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
+    if [[ -z "${manifest_response}" || "${manifest_response}" == "null" ]] || jq -e '.success == false' <<<"${manifest_response}" >/dev/null 2>&1; then
+      debug "Token invalid or expired. Clearing session."
+      rm -f "${token_file}"
+      token=""
+      manifest_response=""
+    else
+      debug "Token verified successfully."
+      authToken="${token}"
+      manifest="${manifest_response}"
+      return 0
+    fi
+  fi
+
+  debug "No valid token found. Please log in."
+
+  user="$(prompt_text "Ebonhold Login" "Enter your username:")" || exit 1
+  pass="$(prompt_password "Ebonhold Login" "Password for ${user}")" || exit 1
+
+  debug "Posting credentials to authentication portal..."
+  session="$(curl -s -X POST -w "\n%{http_code}" \
+    -H "Content-Type: application/json" \
+    -H "User-Agent: EbonholdLauncher/1.0" \
+    -d "{\"username\":\"${user}\",\"password\":\"${pass}\",\"rememberMe\":true}" \
+    "${login_api}")"
+
+  http_code="$(tail -n1 <<<"${session}")"
+  session="$(head -n-1 <<<"${session}")"
+
+  debug "HTTP return code ${http_code}"
+  if [[ "${debug}" == "true" ]]; then
+    debug "Login response body:"
+    echo "${session}" | jq . 2>/dev/null || echo "${session}" >&2
+  fi
+
+  if ! jq -e '.success' <<<"${session}" >/dev/null 2>&1 && [[ "${http_code}" -ne 200 ]]; then
+    message="$(jq -r '.message // empty' <<<"${session}")"
+    [[ -z "${message}" ]] && message="HTTP Gateway Reject Code: ${http_code}"
+    error 1 "Session authorization failed.\n${message}"
+  fi
+
+  token="$(jq -r '.token' <<<"${session}")"
+  if [[ -z "${token}" || "${token}" == "null" ]]; then
+    error 1 "Login succeeded but no valid token was returned."
+  fi
+
+  echo -n "${token}" >"${token_file}"
+  chmod 600 "${token_file}"
+  debug "Secure auth token serialized locally (permissions: 600)."
+
+  manifest_response="$(curl -s -H "Authorization: Bearer ${token}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
+  if [[ -z "${manifest_response}" || "${manifest_response}" == "null" ]] || jq -e '.success == false' <<<"${manifest_response}" >/dev/null 2>&1; then
+    error 1 "Failed to fetch manifest with new token. Please try again."
+  fi
+
+  authToken="${token}"
+  manifest="${manifest_response}"
+  debug "Authentication successful."
+}
 
 if [[ -t 0 ]]; then interactiveShell="true"; else interactiveShell="false"; fi
 if [[ "$XDG_SESSION_TYPE" = "x11" ]] ||
@@ -234,7 +303,6 @@ update_manifest_patches() {
     fi
   done <<<"$(jq -r 'keys[]' <<<"${patches_json}")"
 
-  # Post‑scan sizes
   while read -r patch_name; do
     [[ -z "${patch_name}" ]] && continue
     file_path="Data/${patch_name}.MPQ"
@@ -281,72 +349,7 @@ for arg in "${@}"; do
 done
 set -- "${filtered_args[@]}"
 
-for ((i = 1; i <= ${#}; i++)); do
-  arg="${!i}"
-  next="$((i + 1))"
-  case "${arg}" in
-  -login) [[ ${next} -le ${#} ]] && ebonhold_user="${!next}" ;;
-  -password) [[ ${next} -le ${#} ]] && ebonhold_password="${!next}" ;;
-  esac
-done
-[[ -n "${ebonhold_user}" ]] && [[ -n "${ebonhold_password}" ]] && debug "Fetched credentials from launch arguments"
-
-if [[ -z "${authToken}" && -f "${targetdir}/.updaterToken" ]]; then
-  token_file="${targetdir}/.updaterToken"
-  authToken="$(<"${token_file}")"
-  if [[ -z "${authToken}" || "${authToken}" == "null" ]]; then
-    unset authToken
-  fi
-fi
-
-if [[ -n "${authToken}" ]]; then
-  debug "Auth token found, verifiying token."
-  manifest="$(curl -s -H "Authorization: Bearer ${authToken}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
-  if [[ -z "${manifest}" || "${manifest}" == "null" ]] || jq -e '.success == false' <<<"${manifest}" >/dev/null 2>&1; then
-    debug "Token invalid or expired, clearing session..."
-    rm -f "${token_file}"
-    unset authToken manifest
-  else
-    debug "Token verified successfully."
-  fi
-fi
-
-if [[ -z "${manifest}" ]]; then
-  [[ -z "${ebonhold_user}" ]] && { ebonhold_user="$(prompt_text "Ebonhold Login" "Enter your username:")" || exit 1; }
-  [[ -z "${ebonhold_password}" ]] && { ebonhold_password="$(prompt_password "Ebonhold Login" "Password for ${ebonhold_user}")" || exit 1; }
-
-  debug "Posting credentials to authentication portal..."
-  session="$(curl -s -X POST -w "\n%{http_code}" \
-    -H "Content-Type: application/json" \
-    -H "User-Agent: EbonholdLauncher/1.0" \
-    -d "{\"username\":\"${ebonhold_user}\",\"password\":\"${ebonhold_password}\",\"rememberMe\":true}" \
-    "${login_api}")"
-
-  http_code="$(tail -n1 <<<"${session}")"
-  session="$(head -n-1 <<<"${session}")"
-
-  debug "HTTP return code ${http_code}"
-  if [[ "${debug}" == "true" ]]; then
-    debug "Login response body:"
-    echo "${session}" | jq . 2>/dev/null || echo "${session}" >&2
-  fi
-
-  if ! jq -e '.success' <<<"${session}" >/dev/null 2>&1 && [[ "${http_code}" -ne 200 ]]; then
-    message="$(jq -r '.message // empty' <<<"${session}")"
-    [[ -z "${message}" ]] && message="HTTP Gateway Reject Code: ${http_code}"
-    error 1 "Session authorization failed.\n${message}"
-  else
-    debug "Session authenticated successfully. Fetching patch data layout..."
-    authToken="$(jq -r '.token' <<<"${session}")"
-    if [[ -z "${authToken}" || "${authToken}" == "null" ]]; then
-      error 1 "Login succeeded but no valid token was returned."
-    fi
-    echo -n "${authToken}" >"${token_file}"
-    debug "Secure auth token serialized locally."
-    manifest="$(curl -s -H "Authorization: Bearer ${authToken}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
-  fi
-fi
-
+manage_token
 if [[ "${debug}" == "true" ]]; then
   debug "Public manifest:"
   echo "${manifest}" | jq . 2>/dev/null || echo "${manifest}" >&2
