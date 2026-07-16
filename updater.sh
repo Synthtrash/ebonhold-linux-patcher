@@ -2,33 +2,23 @@
 
 : "${debug:=false}"
 : "${game:=roguelike-prod}"
+verify_only=false
+quiet=false
+dry_run=false
+parallel=4
 
-scriptdir="$(dirname "$(readlink -f "${0}")")"
+scriptdir="$(dirname "$(realpath "${0}")")"
 targetdir="${PWD}"
 
 login_api="https://api.project-ebonhold.com/api/auth/login"
-manifest_api="https://api.project-ebonhold.com/api/launcher/file-hashes?server_name=roguelike-prod"
+games_api="https://api.project-ebonhold.com/api/launcher/games"
+status_api="https://api.project-ebonhold.com/api/server/status"
 patch_download_base="https://api.project-ebonhold.com/api/launcher/download?file_ids="
 token_file="${targetdir}/.updaterToken"
 
-declare -A PATCH_IDS=(
-  ["patch-4"]="191"
-  ["patch-5"]="192"
-  ["patch-6"]="193"
-)
-
-declare -A EXTRA_FILES=(
-  ["AwesomeWotlkLib.dll"]="1"
-  ["Wow.exe"]="47"
-  ["Data/patch-X.MPQ"]="181"
-  ["Data/patch-I.MPQ"]="190"
-  ["skia.dll"]="204"
-  ["ebonhold.dll"]="205"
-)
-
 manage_token() {
   local token=""
-  local manifest_response=""
+  local games_response=""
   local user=""
   local pass=""
 
@@ -43,39 +33,47 @@ manage_token() {
 
   if [[ -n "${token}" ]]; then
     debug "Auth token found, verifying token."
-    manifest_response="$(curl -s -H "Authorization: Bearer ${token}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
-    if [[ -z "${manifest_response}" || "${manifest_response}" == "null" ]] || jq -e '.success == false' <<<"${manifest_response}" >/dev/null 2>&1; then
+    games_response="$(curl -s \
+      -H "Authorization: Bearer ${token}" \
+      -H "User-Agent: EbonholdLauncher/1.0" \
+      -H "Accept: application/json" \
+      -H "X-Client-Id: EbonholdLauncher" \
+      -H "Origin: https://project-ebonhold.com" \
+      -H "Referer: https://project-ebonhold.com/download" \
+      "${games_api}")"
+    if [[ -z "${games_response}" || "${games_response}" == "null" ]] || jq -e '.success == false' <<<"${games_response}" >/dev/null 2>&1; then
       debug "Token invalid or expired. Clearing session."
       rm -f "${token_file}"
       token=""
-      manifest_response=""
+      games_response=""
     else
       debug "Token verified successfully."
       authToken="${token}"
-      manifest="${manifest_response}"
+      games_manifest="${games_response}"
       return 0
     fi
   fi
 
   debug "No valid token found. Please log in."
 
-  user="$(prompt_text "Ebonhold Login" "Enter your username:")" || exit 1
-  pass="$(prompt_password "Ebonhold Login" "Password for ${user}")" || exit 1
+  user="$(prompt_text "Ebonhold Login" "Enter your username:")" || error 1 "Cannot prompt for username: no terminal and no display available. Run interactively or install zenity."
+  pass="$(prompt_password "Ebonhold Login" "Password for ${user}")" || error 1 "Cannot prompt for password: no terminal and no display available."
 
   debug "Posting credentials to authentication portal..."
-  session="$(curl -s -X POST -w "\n%{http_code}" \
-    -H "Content-Type: application/json" \
-    -H "User-Agent: EbonholdLauncher/1.0" \
-    -d "{\"username\":\"${user}\",\"password\":\"${pass}\",\"rememberMe\":true}" \
-    "${login_api}")"
+  session="$(printf '{"username":"%s","password":"%s","rememberMe":true}' "${user}" "${pass}" |
+    curl -s -X POST -w "\n%{http_code}" \
+      -H "Content-Type: application/json" \
+      -H "User-Agent: EbonholdLauncher/1.0" \
+      -d @- \
+      "${login_api}")"
 
-  http_code="$(tail -n1 <<<"${session}")"
-  session="$(head -n-1 <<<"${session}")"
+  http_code="$(sed -n '$p' <<<"${session}")"
+  session="$(sed '$d' <<<"${session}")"
 
   debug "HTTP return code ${http_code}"
   if [[ "${debug}" == "true" ]]; then
     debug "Login response body:"
-    echo "${session}" | jq . 2>/dev/null || echo "${session}" >&2
+    printf '%s\n' "${session}" | jq . 2>/dev/null || printf '%s\n' "${session}" >&2
   fi
 
   if ! jq -e '.success' <<<"${session}" >/dev/null 2>&1 && [[ "${http_code}" -ne 200 ]]; then
@@ -89,18 +87,25 @@ manage_token() {
     error 1 "Login succeeded but no valid token was returned."
   fi
 
-  echo -n "${token}" >"${token_file}"
+  printf '%s' "${token}" >"${token_file}"
   chmod 600 "${token_file}"
   debug "Secure auth token serialized locally (permissions: 600)."
 
-  manifest_response="$(curl -s -H "Authorization: Bearer ${token}" -H "User-Agent: EbonholdLauncher/1.0" "${manifest_api}")"
-  if [[ -z "${manifest_response}" || "${manifest_response}" == "null" ]] || jq -e '.success == false' <<<"${manifest_response}" >/dev/null 2>&1; then
-    error 1 "Failed to fetch manifest with new token. Please try again."
+  games_response="$(curl -s \
+    -H "Authorization: Bearer ${token}" \
+    -H "User-Agent: EbonholdLauncher/1.0" \
+    -H "Accept: application/json" \
+    -H "X-Client-Id: EbonholdLauncher" \
+    -H "Origin: https://project-ebonhold.com" \
+    -H "Referer: https://project-ebonhold.com/download" \
+    "${games_api}")"
+  if [[ -z "${games_response}" || "${games_response}" == "null" ]] || jq -e '.success == false' <<<"${games_response}" >/dev/null 2>&1; then
+    error 1 "Failed to fetch games manifest with new token. Please try again."
   fi
 
   unset user pass
   authToken="${token}"
-  manifest="${manifest_response}"
+  games_manifest="${games_response}"
   debug "Authentication successful."
 }
 
@@ -114,14 +119,16 @@ else
   GUI="false"
 fi
 [[ -x "$(command -v zenity)" ]] || GUI="false"
-[[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]] && exit 1
+if [[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]]; then
+  error 1 "Cannot run in non-interactive mode without a display. Install zenity or run interactively first."
+fi
 
 BLUE="\033[0;34m" RED="\033[0;31m" YELLOW="\033[0;33m" GREEN="\033[0;32m" NC="\033[0m"
 
 debug() {
   local msg="${*}"
-  if [[ "${debug}" == "true" ]]; then
-    echo -e "${BLUE}[DEBUG]:${NC} ${YELLOW}${msg}${NC}" >&2
+  if [[ "${debug}" == "true" ]] && [[ "${quiet}" == "false" ]]; then
+    printf '%s[DEBUG]:%s %s%s%s\n' "${BLUE}" "${NC}" "${YELLOW}" "${msg}" "${NC}" >&2
   fi
 }
 
@@ -136,7 +143,7 @@ error() {
   if [[ "${GUI}" == "true" ]]; then
     zenity --error --title="Error" --text="${msg}" --width=400 2>/dev/null
   else
-    echo -e "\n\033[2K${RED}[ERROR]:${NC} ${YELLOW}${msg}${NC}" >&2
+    printf '\n\033[2K%s[ERROR]:%s %s%b%s\n' "${RED}" "${NC}" "${YELLOW}" "${msg}" "${NC}" >&2
   fi
   [[ "${exit_code}" -ge "1" ]] && exit "${exit_code}"
 }
@@ -147,10 +154,10 @@ prompt_text() {
     zenity --entry --title="${title}" --text="${text}" --width=400 2>/dev/null || return 1
   else
     local input
-    echo "${title}" >&2
+    printf '%s\n' "${title}" >&2
     read -r -p "${text} > " input
     [[ -z "${input}" ]] && return 1
-    echo -n "${input}"
+    printf '%s' "${input}"
   fi
 }
 
@@ -160,21 +167,21 @@ prompt_password() {
     zenity --password --title="${title}" --text="${text}" --width=400 2>/dev/null
   else
     local input
-    echo "${title}" >&2
-    read -r -s -p "Password: >" input
+    printf '%s\n' "${title}" >&2
+    read -r -s -p "${text} > " input
     [[ -z "${input}" ]] && return 1
-    echo -n "${input}"
+    printf '%s' "${input}"
   fi
 }
 
 format_bytes() {
   local bytes="${1}"
   if ((bytes < 1024)); then
-    echo "${bytes} B"
+    printf '%s B\n' "${bytes}"
   elif ((bytes < 1048576)); then
-    printf "%.2f KB\n" "$(echo "scale=2; ${bytes}/1024" | bc)"
+    printf '%.2f KB\n' "$(printf 'scale=2; %s/1024\n' "${bytes}" | bc)"
   else
-    printf "%.2f MB\n" "$(echo "scale=2; ${bytes}/1048576" | bc)"
+    printf '%.2f MB\n' "$(printf 'scale=2; %s/1048576\n' "${bytes}" | bc)"
   fi
 }
 
@@ -184,11 +191,13 @@ download_file_by_id() {
   local description="${3:-$dest_path}"
   local retry=0
   local max_retries=1
+  local tmp_out=""
 
   debug "Downloading file ID ${file_id} -> ${dest_path}"
 
   while [[ $retry -le $max_retries ]]; do
     tmp_out="$(mktemp)"
+    trap 'rm -f "${tmp_out}"' EXIT INT TERM
     status="$(curl -s -w "%{http_code}" -o "${tmp_out}" \
       -H "Authorization: Bearer ${authToken}" \
       -H "User-Agent: EbonholdLauncher/1.0" \
@@ -199,19 +208,20 @@ download_file_by_id() {
       "${patch_download_base}${file_id}" 2>/dev/null)"
     response="$(<"${tmp_out}")"
     rm -f "${tmp_out}"
+    trap - EXIT INT TERM
 
     if [[ "${status}" != "200" ]]; then
       if [[ "${status}" == "401" && $retry -lt $max_retries ]]; then
         debug "Token rejected (401). Re‑authenticating..."
         rm -f "${token_file}"
-        manage_token # updates global authToken
+        manage_token
         ((retry++))
         debug "Retry ${retry}/${max_retries} with new token."
         continue
       fi
-      echo -e "${RED}[ERROR]${NC} Failed to get download URL for ID ${file_id} (HTTP ${status})"
-      echo "Server response:"
-      echo "${response}" | jq . 2>/dev/null || echo "${response}"
+      printf '%s[ERROR]%s Failed to get download URL for ID %s (HTTP %s)\n' "${RED}" "${NC}" "${file_id}" "${status}"
+      printf 'Server response:\n'
+      printf '%s\n' "${response}" | jq . 2>/dev/null || printf '%s\n' "${response}"
       return 1
     fi
 
@@ -220,127 +230,268 @@ download_file_by_id() {
       url="$(jq --raw-output '.url' <<<"${response}" 2>/dev/null)"
     fi
     if [[ -z "${url}" || "${url}" == "null" ]]; then
-      echo -e "${RED}[ERROR]${NC} No download URL found for ID ${file_id}"
+      printf '%s[ERROR]%s No download URL found for ID %s\n' "${RED}" "${NC}" "${file_id}"
       return 1
     fi
 
     debug "Download URL: ${url}"
     mkdir -p "$(dirname "${dest_path}")"
 
-    echo -e "${BLUE}[DOWNLOADING]${NC} ${description}..."
+    if [[ "${quiet}" == "false" ]]; then
+      printf '%s[DOWNLOADING]%s %s...\n' "${BLUE}" "${NC}" "${description}"
+    fi
     if ! curl -fL# "${url}" -o "${dest_path}"; then
-      echo -e "${RED}[ERROR]${NC} Failed to download ${description}"
+      printf '%s[ERROR]%s Failed to download %s\n' "${RED}" "${NC}" "${description}"
       return 1
     fi
 
-    local size="$(stat -c%s "${dest_path}" 2>/dev/null || echo "0")"
-    echo -e "${GREEN}[FINISHED]${NC} ${description} ($(format_bytes ${size}))\n"
+    local size="$(stat -c%s "${dest_path}" 2>/dev/null || printf '0')"
+    if [[ "${quiet}" == "false" ]]; then
+      printf '%s[FINISHED]%s %s (%s)\n\n' "${GREEN}" "${NC}" "${description}" "$(format_bytes "${size}")"
+    fi
     return 0
   done
 
-  echo -e "${RED}[ERROR]${NC} Still getting 401 after re‑authentication. Please try again."
+  printf '%s[ERROR]%s Still getting 401 after re‑authentication. Please try again.\n' "${RED}" "${NC}"
   return 1
 }
 
-download_extra_files() {
-  local any_failed=0
+check_server_status() {
+  debug "Checking server status..."
+  local response="$(curl -s "${status_api}")"
+  if [[ -z "${response}" ]] || ! jq -e '.success' <<<"${response}" >/dev/null 2>&1; then
+    printf '%s[WARN]%s Could not retrieve server status.\n' "${YELLOW}" "${NC}"
+    return 0
+  fi
+  local online="$(jq -r '.data.online' <<<"${response}")"
+  local realm_name="$(jq -r '.data.serverName // "unknown"' <<<"${response}")"
+  if [[ "${online}" == "true" ]]; then
+    printf '%s[INFO]%s Server %s is online.\n' "${GREEN}" "${NC}" "${realm_name}"
+  else
+    printf '%s[WARN]%s Server %s appears offline.\n' "${YELLOW}" "${NC}" "${realm_name}"
+    printf '  You can still update files, but the game may not work until the server is back.\n'
+  fi
+  printf '\n'
+}
 
-  for file_path in "${!EXTRA_FILES[@]}"; do
-    local id="${EXTRA_FILES[$file_path]}"
-    local dest="${targetdir}/${file_path}"
-    if [[ -f "${dest}" ]]; then
-      debug "Extra file ${file_path} already exists, skipping."
-      continue
+update_realmlist() {
+  local realmlist="$1"
+  local dest="${targetdir}/Data/enUS/realmlist.wtf"
+  mkdir -p "$(dirname "${dest}")"
+  if [[ -f "${dest}" ]]; then
+    local current="$(<"${dest}")"
+    if [[ "${current}" != "set realmlist ${realmlist}" ]]; then
+      printf '%s[REALMLIST]%s Updating %s to %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
+      printf 'set realmlist %s\n' "${realmlist}" >"${dest}"
+    else
+      debug "realmlist.wtf already correct."
     fi
-    if ! download_file_by_id "$id" "$dest" "$file_path"; then
-      any_failed=1
+  else
+    printf '%s[REALMLIST]%s Creating %s with %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
+    printf 'set realmlist %s\n' "${realmlist}" >"${dest}"
+  fi
+}
+
+collect_core_files() {
+  local manifest="$1"
+  local game_slug="$2"
+  local files_json
+
+  files_json="$(jq -c '.data.common.files[] | select(.option_slug == null)' <<<"$manifest")"
+  files_json+=$'\n'"$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.option_slug == null)' <<<"$manifest")"
+
+  printf '%s\n' "$files_json" | grep -v '^$'
+}
+
+verify_files() {
+  local files_json="$1"
+  local mismatches=0 missing=0 ok=0 total=0
+  local path expected_b64 expected_md5 dest local_md5
+
+  printf '\nVerifying files...\n\n'
+
+  while read -r file; do
+    [[ -z "${file}" ]] && continue
+    path="$(jq -r '.file_path_from_game_root' <<<"$file")"
+    expected_b64="$(jq -r '.file_hash' <<<"$file")"
+    expected_md5="$(printf '%s' "${expected_b64}" | base64 --decode | od -An -tx1 | tr -d ' \n')"
+    dest="${targetdir}/${path}"
+    total=$((total + 1))
+
+    if [[ ! -f "${dest}" ]]; then
+      printf '%s[MISSING]%s %s\n' "${RED}" "${NC}" "${path}"
+      missing=$((missing + 1))
+    else
+      local_md5="$(md5sum "${dest}" | cut -d' ' -f1)"
+      if [[ "${local_md5}" != "${expected_md5}" ]]; then
+        printf '%s[MISMATCH]%s %s\n' "${RED}" "${NC}" "${path}"
+        printf '  Expected: %s\n' "${expected_md5}"
+        printf '  Local:    %s\n' "${local_md5}"
+        mismatches=$((mismatches + 1))
+      else
+        printf '%s[OK]%s %s\n' "${GREEN}" "${NC}" "${path}"
+        ok=$((ok + 1))
+      fi
+    fi
+  done <<<"$files_json"
+
+  printf '\n==========================================\n'
+  printf '         VERIFICATION SUMMARY            \n'
+  printf '==========================================\n'
+  printf 'Total files checked: %s\n' "${total}"
+  printf '%s OK: %s%s\n' "${GREEN}" "${ok}" "${NC}"
+  printf '%s Mismatch: %s%s\n' "${RED}" "${mismatches}" "${NC}"
+  printf '%s Missing: %s%s\n' "${YELLOW}" "${missing}" "${NC}"
+  printf '==========================================\n\n'
+
+  [[ ${mismatches} -eq 0 && ${missing} -eq 0 ]] && return 0 || return 1
+}
+
+update_files() {
+  local files_json="$1"
+  local size_before=0 size_after=0 size_downloaded=0 current_size=0
+
+  if [[ "${verify_only}" == "true" ]]; then
+    verify_files "$files_json"
+    return $?
+  fi
+
+  if [[ "${dry_run}" != "true" ]]; then
+    while read -r file; do
+      [[ -z "${file}" ]] && continue
+      path="$(jq -r '.file_path_from_game_root' <<<"$file")"
+      dest="${targetdir}/${path}"
+      if [[ -f "${dest}" ]]; then
+        current_size="$(stat -c%s "${dest}" 2>/dev/null || printf '0')"
+        size_before=$((size_before + current_size))
+      fi
+    done <<<"$files_json"
+  fi
+
+  declare -a download_tasks=()
+  while read -r file; do
+    [[ -z "${file}" ]] && continue
+    path="$(jq -r '.file_path_from_game_root' <<<"$file")"
+    id="$(jq -r '.id' <<<"$file")"
+    expected_b64="$(jq -r '.file_hash' <<<"$file")"
+    expected_md5="$(printf '%s' "${expected_b64}" | base64 --decode | od -An -tx1 | tr -d ' \n')"
+    dest="${targetdir}/${path}"
+
+    download_needed=false
+    if [[ ! -f "${dest}" ]]; then
+      printf '%s[MISSING]%s %s is missing.\n' "${YELLOW}" "${NC}" "${path}"
+      download_needed=true
+    else
+      local_md5="$(md5sum "${dest}" | cut -d' ' -f1)"
+      if [[ "${local_md5}" != "${expected_md5}" ]]; then
+        printf '%s[MISMATCH]%s %s MD5 verification failed.\n' "${RED}" "${NC}" "${path}"
+        printf '  Expected: %s\n' "${expected_md5}"
+        printf '  Local:    %s\n' "${local_md5}"
+        download_needed=true
+      else
+        printf '%s[OK]%s %s matches MD5 signature: %s%s%s\n' "${GREEN}" "${NC}" "${path}" "${GREEN}" "${expected_md5}" "${NC}"
+      fi
+    fi
+
+    if [[ "${download_needed}" == "true" ]]; then
+      download_tasks+=("${id}|${dest}|${path}")
+    fi
+  done <<<"$files_json"
+
+  if [[ ${#download_tasks[@]} -eq 0 ]]; then
+    if [[ "${quiet}" == "false" ]]; then
+      printf '%sAll files are up to date.%s\n' "${GREEN}" "${NC}"
+    fi
+    return 0
+  fi
+
+  if [[ "${dry_run}" == "true" ]]; then
+    printf '%s[DRY RUN]%s The following files would be downloaded:\n' "${YELLOW}" "${NC}"
+    for task in "${download_tasks[@]}"; do
+      id="${task%%|*}"
+      rest="${task#*|}"
+      dest="${rest%%|*}"
+      path="${rest#*|}"
+      printf '  - %s (ID: %s)\n' "${path}" "${id}"
+    done
+    printf 'Total: %s files\n' "${#download_tasks[@]}"
+    return 0
+  fi
+
+  if [[ "${quiet}" == "false" ]]; then
+    printf '%sStarting %s downloads with %s concurrent jobs...%s\n\n' "${BLUE}" "${#download_tasks[@]}" "${parallel}" "${NC}"
+  fi
+
+  local max_jobs="${parallel}"
+  local running=0
+  local failed=0
+  declare -a pids=()
+
+  for task in "${download_tasks[@]}"; do
+    id="${task%%|*}"
+    rest="${task#*|}"
+    dest="${rest%%|*}"
+    path="${rest#*|}"
+
+    (
+      download_file_by_id "$id" "$dest" "$path"
+    ) &
+    pids+=($!)
+    running=$((running + 1))
+
+    if [[ $running -ge $max_jobs ]]; then
+      wait -n
+      new_pids=()
+      for p in "${pids[@]}"; do
+        if kill -0 "$p" 2>/dev/null; then
+          new_pids+=("$p")
+        fi
+      done
+      pids=("${new_pids[@]}")
+      running=${#pids[@]}
     fi
   done
 
-  return $any_failed
-}
+  for p in "${pids[@]}"; do
+    wait "$p" || failed=$((failed + 1))
+  done
 
-update_manifest_patches() {
-  local patches_json="$1"
+  if [[ $failed -gt 0 ]]; then
+    error 1 "One or more downloads failed."
+  fi
 
-  local patch_name b64_hash expected_md5 local_md5 file_path
-  local numeric_id
-  local size_before=0 size_after=0 size_downloaded=0 current_size=0
-
-  [[ -z "${patches_json}" || "${patches_json}" == "null" ]] && return
-
-  while read -r patch_name; do
-    [[ -z "${patch_name}" ]] && continue
-    file_path="Data/${patch_name}.MPQ"
-    if [[ -f "${targetdir}/${file_path}" ]]; then
-      current_size="$(stat -c%s "${targetdir}/${file_path}")"
-      size_before=$((size_before + current_size))
-    fi
-  done <<<"$(jq -r 'keys[]' <<<"${patches_json}")"
-
-  while read -r patch_name; do
-    [[ -z "${patch_name}" ]] && continue
-    file_path="Data/${patch_name}.MPQ"
-
-    b64_hash="$(jq -r --arg key "${patch_name}" '.[$key]' <<<"${patches_json}")"
-    expected_md5="$(echo -n "${b64_hash}" | base64 --decode | od -An -tx1 | tr -d ' \n')"
-
-    download="false"
-    if [[ ! -f "${targetdir}/${file_path}" ]]; then
-      echo -e "${YELLOW}[MISSING]${NC} ${patch_name} -> ${file_path} is missing."
-      download="true"
-    else
-      local_md5="$(md5sum "${targetdir}/${file_path}" | cut -d' ' -f1)"
-      if [[ "${local_md5}" != "${expected_md5}" ]]; then
-        echo -e "${RED}[MISMATCH]${NC} ${patch_name} MD5 verification failed."
-        echo -e "  Expected: ${expected_md5}"
-        echo -e "  Local:    ${local_md5}"
-        download="true"
-      else
-        echo -e "${GREEN}[OK]${NC} ${patch_name} matches MD5 signature: ${GREEN}${expected_md5}${NC}"
-      fi
-    fi
-
-    if [[ "${download}" == "true" ]]; then
-      numeric_id="${PATCH_IDS[$patch_name]}"
-      if [[ -z "${numeric_id}" ]]; then
-        error 1 "No numeric ID known for ${patch_name}. Please add to PATCH_IDS."
-      fi
-      if download_file_by_id "$numeric_id" "${targetdir}/${file_path}" "$patch_name"; then
-        current_size="$(stat -c%s "${targetdir}/${file_path}")"
-        size_downloaded=$((size_downloaded + current_size))
-        [[ -d "${targetdir}/Cache" ]] && touch "${targetdir}/Cache/invalid"
-      else
-        error 1 "Failed to download patch ${patch_name}"
-      fi
-    fi
-  done <<<"$(jq -r 'keys[]' <<<"${patches_json}")"
-
-  while read -r patch_name; do
-    [[ -z "${patch_name}" ]] && continue
-    file_path="Data/${patch_name}.MPQ"
-    if [[ -f "${targetdir}/${file_path}" ]]; then
-      current_size="$(stat -c%s "${targetdir}/${file_path}")"
+  while read -r file; do
+    [[ -z "${file}" ]] && continue
+    path="$(jq -r '.file_path_from_game_root' <<<"$file")"
+    dest="${targetdir}/${path}"
+    if [[ -f "${dest}" ]]; then
+      current_size="$(stat -c%s "${dest}" 2>/dev/null || printf '0')"
       size_after=$((size_after + current_size))
     fi
-  done <<<"$(jq -r 'keys[]' <<<"${patches_json}")"
+  done <<<"$files_json"
 
-  local size_delta=$((size_after - size_before))
-  echo -e "\n=========================================="
-  echo -e "         PATCH OPERATION SUMMARY          "
-  echo -e "=========================================="
-  echo -e "Total Network Downloaded:  $(format_bytes ${size_downloaded})"
-  echo -e "Local Storage Before:      $(format_bytes ${size_before})"
-  echo -e "Local Storage After:       $(format_bytes ${size_after})"
-  if ((size_delta >= 0)); then
-    echo -e "Storage Growth (Delta):   +$(format_bytes ${size_delta})"
-  else
-    abs_delta=$((size_delta * -1))
-    echo -e "Storage Shrinkage (Delta): -$(format_bytes ${abs_delta})"
+  if [[ "${quiet}" == "false" ]]; then
+    local size_delta=$((size_after - size_before))
+    printf '\n==========================================\n'
+    printf '         UPDATE OPERATION SUMMARY          \n'
+    printf '==========================================\n'
+    printf 'Local Storage Before:      %s\n' "$(format_bytes "${size_before}")"
+    printf 'Local Storage After:       %s\n' "$(format_bytes "${size_after}")"
+    if ((size_delta >= 0)); then
+      printf 'Storage Growth (Delta):   +%s\n' "$(format_bytes "${size_delta}")"
+    else
+      abs_delta=$((size_delta * -1))
+      printf 'Storage Shrinkage (Delta): -%s\n' "$(format_bytes "${abs_delta}")"
+    fi
+    printf '==========================================\n\n'
   fi
-  echo -e "==========================================\n"
+
+  return 0
 }
 
+# ============================================================
+# Clear cache
+# ============================================================
 clearCache() {
   local deleted
   if [[ -d "${targetdir}/Cache" ]] && deleted="$(find "${targetdir}/Cache" -iname '*.wdb' -type f -print -delete)"; then
@@ -356,38 +507,68 @@ for arg in "${@}"; do
     debug="true"
     debug "Debug messages enabled"
     ;;
-  --verify) debug "Verification mode enabled" ;;
+  --verify)
+    verify_only=true
+    debug "Verification mode enabled"
+    ;;
+  --quiet)
+    quiet=true
+    ;;
+  --dry-run)
+    dry_run=true
+    debug "Dry-run mode enabled"
+    ;;
+  --help)
+    cat <<EOF
+Usage: $0 [OPTIONS] [--] [game arguments]
+
+Options:
+  --debug           Enable verbose output
+  --verify          Check files against manifest (no downloads)
+  --dry-run         Show what would be done without downloading
+  --quiet           Suppress non-error output
+  --help            Show this help message
+
+For Steam, use as launch option: ./updater.sh --quiet %command%
+EOF
+    exit 0
+    ;;
   *) filtered_args+=("${arg}") ;;
   esac
 done
 set -- "${filtered_args[@]}"
 
 manage_token
-if [[ "${debug}" == "true" ]]; then
-  debug "Public manifest:"
-  echo "${manifest}" | jq . 2>/dev/null || echo "${manifest}" >&2
+
+check_server_status
+
+if ! jq -e --arg slug "${game}" '.data.games[] | select(.slug == $slug)' <<<"${games_manifest}" >/dev/null 2>&1; then
+  error 1 "Game slug '${game}' not found in manifest. Available: $(jq -r '.data.games[].slug' <<<"${games_manifest}" | tr '\n' ' ')"
 fi
 
-if [[ -z "${manifest}" || "${manifest}" == "null" ]] || jq -e '.success == false' <<<"${manifest}" >/dev/null 2>&1; then
-  error 1 "Failed to establish context with verification server."
+realmlist="$(jq -r --arg slug "${game}" '.data.games[] | select(.slug == $slug) | .realmlist' <<<"${games_manifest}")"
+if [[ -n "${realmlist}" && "${realmlist}" != "null" ]]; then
+  update_realmlist "${realmlist}"
 fi
 
-patch_map="$(jq -cM '.patches' <<<"${manifest}" 2>/dev/null)"
+files_to_process="$(collect_core_files "${games_manifest}" "${game}")"
 
-if [[ -z "${patch_map}" || "${patch_map}" == "null" ]]; then
-  error 1 "Manifest formatting verification failed; no patch objects detected."
+if [[ -z "${files_to_process}" ]]; then
+  error 1 "No files found in manifest for game slug '${game}'."
 fi
 
-if [[ -z "${authToken}" || "${authToken}" == "null" ]]; then
-  error 1 "Authentication token is missing. Please log in again."
+update_files "${files_to_process}"
+update_status=$?
+
+if [[ -f "${targetdir}/Cache/invalid" ]] || [[ -d "${targetdir}/Cache" ]]; then
+  clearCache
 fi
 
-update_manifest_patches "${patch_map}"
-download_extra_files
+if [[ "${verify_only}" == "true" ]]; then
+  exit "${update_status}"
+fi
 
-[[ -f "${targetdir}/Cache/invalid" ]] || [ -d "${targetdir}/Cache" ] && clearCache
-
-if [ ${#} -gt 0 ]; then
+if [[ ${#} -gt 0 ]]; then
   if [[ "${*,,}" == *wow.exe* ]]; then
     unset TZ
     export PROTON_FORCE_LARGE_ADDRESS_AWARE=1 WINE_LARGE_ADDRESS_AWARE=1

@@ -1,0 +1,21 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@v6
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
