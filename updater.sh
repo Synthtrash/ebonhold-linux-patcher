@@ -123,7 +123,7 @@ if [[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]]; then
   error 1 "Cannot run in non-interactive mode without a display. Install zenity or run interactively first."
 fi
 
-BLUE="\033[0;34m" RED="\033[0;31m" YELLOW="\033[0;33m" GREEN="\033[0;32m" NC="\033[0m"
+BLUE=$'\033[0;34m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' GREEN=$'\033[0;32m' NC=$'\033[0m'
 
 debug() {
   local msg="${*}"
