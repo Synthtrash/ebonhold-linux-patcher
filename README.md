@@ -16,7 +16,7 @@ Updates and launches the Project Ebonhold game client on Linux.
 
 ## Prerequisites
 
-- **curl**, **jq**, **md5sum**, **bc**, **unzip** – usually pre-installed on most Linux.
+- **curl**, **jq**, **md5sum**, **bc**, **unzip** (including `zipinfo`), **flock** (from `util-linux`) – usually pre-installed on most Linux.
 - **zenity** (optional) – for GUI prompts; falls back to terminal prompts if missing.
 
 ---
