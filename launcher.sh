@@ -19,7 +19,19 @@ addon_ids=()
 addon_update_ids=()
 addon_update_names=()
 
-scriptdir="$(dirname "${0}")"
+script_path="${0}"
+if [[ "${script_path}" != */* ]]; then
+  resolved_script_path="$(command -v -- "${script_path}" 2>/dev/null || true)"
+  if [[ -n "${resolved_script_path}" ]]; then
+    script_path="${resolved_script_path}"
+  elif [[ -f "${script_path}" ]]; then
+    script_path="./${script_path}"
+  else
+      printf 'Could not determine launcher location.\n' >&2
+      exit 1
+  fi
+fi
+scriptdir="$(dirname "${script_path}")"
 targetdir="$(realpath -m "${scriptdir}")"
 target_root="$(realpath -m "${targetdir}")"
 
@@ -30,6 +42,7 @@ patch_download_base="https://api.project-ebonhold.com/api/launcher/download?file
 addons_api="https://api.project-ebonhold.com/api/launcher/addons"
 addon_download_base="https://api.project-ebonhold.com/api/launcher/addons/download?addon_ids="
 token_file="${targetdir}/.updaterToken"
+addon_state_file="${targetdir}/Interface/AddOns/.ebonhold-launcher-addons.json"
 
 is_read_only_mode() {
   [[ "${verify_only}" == "true" || "${dry_run}" == "true" ]]
@@ -399,12 +412,12 @@ resolve_addons() {
   local addon
   local addon_id
 
-  requested="${requested//[[:space:]]/}"
-  [[ -n "${requested}" ]] || error 1 "No addon names or IDs were provided."
-
   addon_ids=()
   IFS=',' read -r -a requested_addons <<<"${requested}"
   for addon in "${requested_addons[@]}"; do
+    addon="${addon#"${addon%%[![:space:]]*}"}"
+    addon="${addon%"${addon##*[![:space:]]}"}"
+    [[ -n "${addon}" ]] || error 1 "No addon names or IDs were provided."
     addon_id="$(jq -r --arg addon "${addon}" '
       [.addons[] | select((.id | tostring) == $addon or (.name | ascii_downcase) == ($addon | ascii_downcase)) | .id]
       | if length == 1 then .[0] else empty end
@@ -427,6 +440,29 @@ list_addons() {
   print_addon_catalog
 }
 
+record_addon_install() {
+  local addon_id="$1"
+  local addon_name="$2"
+  local updated_at="$3"
+  local folders_json="$4"
+  local state='{"addons":{}}'
+  local state_dir
+  local temporary_state
+
+  state_dir="$(dirname "${addon_state_file}")"
+  mkdir -p "${state_dir}" || error 1 "Could not create ${state_dir}."
+  if [[ -f "${addon_state_file}" ]] && jq -e '.addons | type == "object"' "${addon_state_file}" >/dev/null 2>&1; then
+    state="$(<"${addon_state_file}")"
+  fi
+  temporary_state="$(mktemp "${state_dir}/.ebonhold-launcher-addons.XXXXXX")" || error 1 "Could not create addon state file."
+  if ! jq --arg id "${addon_id}" --arg name "${addon_name}" --arg updated_at "${updated_at}" --argjson folders "${folders_json}" \
+    '.addons[$id] = {name: $name, updated_at: $updated_at, folders: $folders}' <<<"${state}" >"${temporary_state}"; then
+    rm -f "${temporary_state}"
+    error 1 "Could not save addon update state."
+  fi
+  mv -f "${temporary_state}" "${addon_state_file}" || error 1 "Could not save addon update state."
+}
+
 addon_directory() {
   local addon_name="$1"
   local directory
@@ -443,23 +479,85 @@ addon_directory() {
   return 1
 }
 
+addon_directories() {
+  local addon_id="$1"
+  local addon_name="$2"
+  local folder
+  local directory
+  local found=false
+
+  while read -r folder; do
+    [[ -z "${folder}" || "${folder}" == *"/"* || "${folder}" == "." || "${folder}" == ".." || "${folder}" =~ [[:cntrl:]] ]] && continue
+    directory="${targetdir}/Interface/AddOns/${folder}"
+    if [[ -d "${directory}" ]] && find "${directory}" -type f -print -quit | grep -q .; then
+      printf '%s\n' "${directory}"
+      found=true
+    fi
+  done < <(jq -r --arg id "${addon_id}" '.addons[$id].folders[]? // empty' "${addon_state_file}" 2>/dev/null)
+
+  if [[ "${found}" == "false" ]] && directory="$(addon_directory "${addon_name}")" && find "${directory}" -type f -print -quit | grep -q .; then
+    printf '%s\n' "${directory}"
+  fi
+}
+
+addon_folder_is_shared() {
+  local addon_id="$1"
+  local folder="$2"
+
+  jq -e --arg id "${addon_id}" --arg folder "${folder}" \
+    'any(.addons | to_entries[] | select(.key != $id) | .value.folders[]?; . == $folder)' "${addon_state_file}" >/dev/null 2>&1
+}
+
+addon_state_is_complete() {
+  local addon_id="$1"
+  local folder
+  local directory
+  local found=false
+
+  while read -r folder; do
+    [[ -z "${folder}" || "${folder}" == *"/"* || "${folder}" == "." || "${folder}" == ".." || "${folder}" =~ [[:cntrl:]] ]] && return 1
+    found=true
+    directory="${targetdir}/Interface/AddOns/${folder}"
+    [[ -d "${directory}" ]] && find "${directory}" -type f -print -quit | grep -q . || return 1
+  done < <(jq -r --arg id "${addon_id}" '.addons[$id].folders[]? // empty' "${addon_state_file}" 2>/dev/null)
+
+  [[ "${found}" == "true" ]]
+}
+
 check_addon_updates() {
-  local addon_id addon_name updated_at directory local_mtime remote_mtime local_display
+  local addon_id addon_name updated_at directories local_mtime remote_mtime local_display state_updated_at
 
   fetch_addon_catalog
   addon_update_ids=()
   addon_update_names=()
   while IFS=$'\t' read -r addon_id addon_name updated_at; do
-    if ! directory="$(addon_directory "${addon_name}")"; then
+    state_updated_at="$(jq -r --arg id "${addon_id}" '.addons[$id].updated_at // empty' "${addon_state_file}" 2>/dev/null)"
+    if [[ -n "${state_updated_at}" ]] && ! addon_state_is_complete "${addon_id}"; then
+      printf '%s[UPDATE AVAILABLE]%s %s (repair required)\n' "${GREEN}" "${NC}" "${addon_name}"
+      addon_update_ids+=("${addon_id}")
+      addon_update_names+=("${addon_name}")
+      continue
+    fi
+
+    directories="$(addon_directories "${addon_id}" "${addon_name}")"
+    if [[ -z "${directories}" ]]; then
       printf '%s[NOT INSTALLED]%s %s\n' "${YELLOW}" "${NC}" "${addon_name}"
       continue
     fi
 
-    local_mtime="$(find "${directory}" -type f -printf '%T@\n' | sort -nr | { IFS= read -r first; printf '%s' "${first}"; })"
     remote_mtime="$(date -d "${updated_at}" +%s 2>/dev/null)" || {
       printf '%s[UNKNOWN]%s %s has an invalid catalog timestamp.\n' "${YELLOW}" "${NC}" "${addon_name}"
       continue
     }
+    if [[ "${state_updated_at}" == "${updated_at}" ]]; then
+      printf '%s[CURRENT]%s %s\n' "${GREEN}" "${NC}" "${addon_name}"
+      continue
+    fi
+
+    local_mtime="$(while read -r directory; do find "${directory}" -type f -printf '%T@\n'; done <<<"${directories}" | sort -nr | { IFS= read -r first; printf '%s' "${first}"; })"
+    if [[ -n "${state_updated_at}" ]]; then
+      local_mtime="$(date -d "${state_updated_at}" +%s 2>/dev/null)"
+    fi
     if [[ -z "${local_mtime}" ]]; then
       printf '%s[UNKNOWN]%s %s has no files to compare.\n' "${YELLOW}" "${NC}" "${addon_name}"
     elif ((remote_mtime > ${local_mtime%.*})); then
@@ -514,16 +612,27 @@ select_addons_interactively() {
 }
 
 install_addon_archive() {
-  local archive="$1"
-  local addon_name="$2"
+  local addon_id="$1"
+  local archive="$2"
+  local addon_name="$3"
   local addons_dir="${targetdir}/Interface/AddOns"
   local staging
   local path
   local top_level
+  local updated_at
+  local folders_json
+  local previous_folder
+  local zip_metadata
   local -a top_levels=()
 
   command -v unzip >/dev/null 2>&1 || error 1 "Installing addons requires unzip."
+  command -v zipinfo >/dev/null 2>&1 || error 1 "Installing addons requires zipinfo."
   mkdir -p "${addons_dir}" || error 1 "Could not create ${addons_dir}."
+  [[ ! -L "${addons_dir}" ]] || error 1 "Refusing symlinked addon directory: ${addons_dir}."
+  zip_metadata="$(zipinfo -l "${archive}")" || error 1 "Could not inspect addon archive for ${addon_name}."
+  while read -r path; do
+    [[ "${path}" =~ ^l[-rwxSsTt]{9}[[:space:]] ]] && error 1 "Addon archive for ${addon_name} contains a symbolic link."
+  done <<<"${zip_metadata}"
 
   while read -r path; do
     [[ -z "${path}" ]] && continue
@@ -538,6 +647,10 @@ install_addon_archive() {
   done < <(unzip -Z1 "${archive}")
 
   [[ ${#top_levels[@]} -gt 0 ]] || error 1 "Addon archive for ${addon_name} is empty."
+  for top_level in "${top_levels[@]}"; do
+    [[ ! -L "${addons_dir}/${top_level}" ]] || error 1 "Refusing symlinked addon folder: ${top_level}."
+    addon_folder_is_shared "${addon_id}" "${top_level}" && error 1 "Cannot safely replace shared addon folder: ${top_level}."
+  done
   staging="$(mktemp -d "${addons_dir}/.updater-addon.XXXXXX")" || error 1 "Could not create addon staging directory."
   if ! unzip -qq "${archive}" -d "${staging}"; then
     rm -rf "${staging}"
@@ -552,14 +665,32 @@ install_addon_archive() {
     }
   done
   rm -rf "${staging}"
+  while read -r previous_folder; do
+    [[ -z "${previous_folder}" || "${previous_folder}" == *"/"* || "${previous_folder}" == "." || "${previous_folder}" == ".." || "${previous_folder}" =~ [[:cntrl:]] ]] && continue
+    [[ " ${top_levels[*]} " == *" ${previous_folder} "* ]] && continue
+    addon_folder_is_shared "${addon_id}" "${previous_folder}" && continue
+    rm -rf "${addons_dir:?}/${previous_folder}"
+  done < <(jq -r --arg id "${addon_id}" '.addons[$id].folders[]? // empty' "${addon_state_file}" 2>/dev/null)
+  updated_at="$(jq -r --argjson id "${addon_id}" '.addons[] | select(.id == $id) | .updated_at' <<<"${addon_catalog}")"
+  [[ -n "${updated_at}" && "${updated_at}" != "null" ]] || error 1 "Could not determine installed addon version."
+  folders_json="$(printf '%s\n' "${top_levels[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  record_addon_install "${addon_id}" "${addon_name}" "${updated_at}" "${folders_json}"
 }
 
 download_addons() {
   local ids
   local response
   local file_id filename url archive addon_name
+  local addon_lock_fd
+  local addons_dir="${targetdir}/Interface/AddOns"
+  local -a response_ids=()
 
   [[ ${#addon_ids[@]} -gt 0 ]] || return 0
+  command -v flock >/dev/null 2>&1 || error 1 "Installing addons requires flock."
+  mkdir -p "${addons_dir}" || error 1 "Could not create ${addons_dir}."
+  [[ ! -L "${addons_dir}" ]] || error 1 "Refusing symlinked addon directory: ${addons_dir}."
+  exec {addon_lock_fd}>"${addons_dir}/.ebonhold-launcher.lock"
+  flock "${addon_lock_fd}" || error 1 "Could not lock addon installation."
   ids="$(IFS=,; printf '%s' "${addon_ids[*]}")"
   response="$(curl -s --connect-timeout 10 --max-time 60 \
     -H "Authorization: Bearer ${authToken}" \
@@ -571,6 +702,17 @@ download_addons() {
     "${addon_download_base}${ids}")"
   [[ -n "${response}" ]] && jq -e '.success == true and (.files | type == "array")' <<<"${response}" >/dev/null 2>&1 || error 1 "Could not retrieve addon download URLs."
 
+  while read -r file_id; do
+    [[ "${file_id}" =~ ^[1-9][0-9]*$ ]] || error 1 "Received an invalid addon download response."
+    [[ " ${addon_ids[*]} " == *" ${file_id} "* ]] || error 1 "Received an unrequested addon download."
+    [[ " ${response_ids[*]} " != *" ${file_id} "* ]] || error 1 "Received a duplicate addon download."
+    jq -e --argjson id "${file_id}" '.addons[] | select(.id == $id)' <<<"${addon_catalog}" >/dev/null || error 1 "Received an unknown addon download."
+    response_ids+=("${file_id}")
+  done < <(jq -r '.files[] | .file_id' <<<"${response}")
+  for file_id in "${addon_ids[@]}"; do
+    [[ " ${response_ids[*]} " == *" ${file_id} "* ]] || error 1 "No download was returned for requested addon ID ${file_id}."
+  done
+
   while IFS=$'\t' read -r file_id filename url; do
     [[ "${file_id}" =~ ^[1-9][0-9]*$ && "${filename}" == Interface/AddOns/*.zip && "${url}" == https://* ]] || error 1 "Received an invalid addon download response."
     addon_name="$(jq -r --argjson id "${file_id}" '.addons[] | select(.id == $id) | .name' <<<"${addon_catalog}")"
@@ -579,10 +721,12 @@ download_addons() {
       rm -f "${archive}"
       error 1 "Failed to download addon ${addon_name}."
     fi
-    install_addon_archive "${archive}" "${addon_name}"
+    install_addon_archive "${file_id}" "${archive}" "${addon_name}"
     rm -f "${archive}"
     [[ "${quiet}" == "true" ]] || printf '%s[ADDON]%s Installed %s\n' "${GREEN}" "${NC}" "${addon_name}"
   done < <(jq -r '.files[] | [.file_id, .filename, .url] | @tsv' <<<"${response}")
+  flock -u "${addon_lock_fd}"
+  exec {addon_lock_fd}>&-
 }
 
 verify_files() {
@@ -846,7 +990,7 @@ Options:
   --quiet           Suppress non-error output
   --help            Show this help message
 
-Default mode updates only game patch files. For Steam, use: ./updater.sh --quiet %command%
+Default mode updates only game patch files. For Steam, use: ./launcher.sh --quiet %command%
 EOF
     exit 0
     ;;
