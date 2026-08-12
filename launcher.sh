@@ -235,13 +235,31 @@ prompt_password() {
 
 format_bytes() {
   local bytes="${1}"
+  local unit
+
   if ((bytes < 1024)); then
     printf '%s B\n' "${bytes}"
-  elif ((bytes < 1048576)); then
-    printf '%.2f KB\n' "$(printf 'scale=2; %s/1024\n' "${bytes}" | bc)"
-  else
-    printf '%.2f MB\n' "$(printf 'scale=2; %s/1048576\n' "${bytes}" | bc)"
+    return 0
   fi
+
+  local bytes_formatted
+  local decimal_point
+
+  if ((bytes < 1048576)); then
+    bytes_formatted="$(printf 'scale=2; %s/1024\n' "${bytes}" | LC_ALL=C bc)"
+    unit="KB"
+  else
+    bytes_formatted="$(printf 'scale=2; %s/1048576\n' "${bytes}" | LC_ALL=C bc)"
+    unit="MB"
+  fi
+
+  decimal_point="$(locale decimal_point 2>/dev/null)"
+  [[ -z "${decimal_point}" ]] && decimal_point='.'
+  if [[ "${decimal_point}" != '.' ]]; then
+    bytes_formatted="${bytes_formatted/./${decimal_point}}"
+  fi
+
+  printf '%s %s\n' "${bytes_formatted}" "${unit}"
 }
 
 download_file_by_id() {
