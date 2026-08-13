@@ -38,6 +38,7 @@ chmod +x launcher.sh
 | `--debug` | Enable verbose output |
 | `--verify` | Check files against manifest without changing client files, cache, realmlist, or token |
 | `--dry-run` | Show downloads that would be needed without changing client files, cache, realmlist, or token |
+| `--quick` | Check only required game patch files, matching the previous default behavior |
 | `--full` | Check and update all common and game files, including optional files |
 | `--status` | Show the authenticated realm status and exit |
 | `--list-addons` | List addons available from the official launcher catalog |
@@ -55,10 +56,10 @@ When run interactively without game arguments, the launcher checks installed add
 2. Right-click the game → Properties → Launch Options:
 
 ```
-/path/to/launcher.sh --quiet %command%
+/path/to/launcher.sh --quick --quiet %command%
 ```
 
-The launcher updates the client silently, then launches the game. If files changed, it clears `.wdb` cache files and creates `Cache/invalid` before launch. If your cached token expires, a zenity login prompt will pop up.
+The launcher quickly checks game patch files, then launches the game. Omit `--quick` to check every required file. If files changed, it clears `.wdb` cache files and creates `Cache/invalid` before launch. If your cached token expires, a zenity login prompt will pop up.
 
 ---
 
