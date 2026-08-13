@@ -399,10 +399,11 @@ collect_core_files() {
   local files_json
 
   if [[ "${full_mode}" == "true" ]]; then
-    files_json="$(jq -c '.data.common.files[] | select(.file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
+    files_json="$(jq -c '(.data.common.files // [])[] | select(.file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
     files_json+=$'\n'"$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
   else
-    files_json="$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.option_slug == null and (.file_path_from_game_root | test("(^|/)patch"; "i")))' <<<"$manifest")"
+    files_json="$(jq -c '(.data.common.files // [])[] | select(.option_slug == null and .file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
+    files_json+=$'\n'"$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.option_slug == null and .file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
   fi
 
   printf '%s\n' "$files_json" | grep -v '^$'
@@ -1008,7 +1009,7 @@ Options:
   --quiet           Suppress non-error output
   --help            Show this help message
 
-Default mode updates only game patch files. For Steam, use: ./launcher.sh --quiet %command%
+Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quiet %command%
 EOF
     exit 0
     ;;
