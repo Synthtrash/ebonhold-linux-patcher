@@ -103,6 +103,14 @@ full_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" 
 [[ "${full_output}" != *"realmlist.wtf"* ]]
 [[ "${full_output}" == *"Ebonhold/common-optional.dat"* ]]
 [[ "${full_output}" == *"Ebonhold/optional.dat"* ]]
+quick_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quick)"
+[[ "${quick_output}" == *"Data/patch-test.MPQ"* ]]
+[[ "${quick_output}" != *"Ebonhold/common-required.dat"* ]]
+[[ "${quick_output}" != *"Ebonhold/new-required.dat"* ]]
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quick --full >/dev/null 2>&1; then
+  printf '%s\n' '--quick and --full were accepted together.' >&2
+  exit 1
+fi
 path_output="$(PATH="${symlink_client}:${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && ebonhold-launcher.sh --dry-run')"
 [[ "${path_output}" == *"[OK]"* ]]
 interpreter_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && bash launcher.sh --dry-run')"

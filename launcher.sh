@@ -9,6 +9,7 @@ parallel=4
 files_updated=false
 realmlist_updated=false
 full=false
+quick=false
 status_only=false
 addons=""
 list_addons_only=false
@@ -396,11 +397,14 @@ collect_core_files() {
   local manifest="$1"
   local game_slug="$2"
   local full_mode="$3"
+  local quick_mode="$4"
   local files_json
 
   if [[ "${full_mode}" == "true" ]]; then
     files_json="$(jq -c '(.data.common.files // [])[] | select(.file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
     files_json+=$'\n'"$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
+  elif [[ "${quick_mode}" == "true" ]]; then
+    files_json="$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.option_slug == null and (.file_path_from_game_root | test("(^|/)patch"; "i")))' <<<"$manifest")"
   else
     files_json="$(jq -c '(.data.common.files // [])[] | select(.option_slug == null and .file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
     files_json+=$'\n'"$(jq -c --arg slug "$game_slug" '.data.games[] | select(.slug == $slug) | .files[] | select(.option_slug == null and .file_path_from_game_root != "Data/enUS/realmlist.wtf")' <<<"$manifest")"
@@ -973,6 +977,9 @@ for arg in "${@}"; do
   --full)
     full=true
     ;;
+  --quick)
+    quick=true
+    ;;
   --status)
     status_only=true
     ;;
@@ -1000,6 +1007,7 @@ Options:
   --debug           Enable verbose output
   --verify          Check files against manifest (no downloads)
   --dry-run         Show what would be done without downloading
+  --quick           Check only required game patch files
   --full            Update all common and game files, including optional files
   --status          Show realm status and exit
   --list-addons     Show addons available for the selected game and exit
@@ -1009,7 +1017,7 @@ Options:
   --quiet           Suppress non-error output
   --help            Show this help message
 
-Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quiet %command%
+Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet %command%
 EOF
     exit 0
     ;;
@@ -1020,6 +1028,10 @@ set -- "${filtered_args[@]}"
 
 if [[ ! "${parallel}" =~ ^[1-9][0-9]*$ ]]; then
   error 1 "parallel must be a positive integer."
+fi
+
+if [[ "${quick}" == "true" && "${full}" == "true" ]]; then
+  error 1 "--quick and --full cannot be used together."
 fi
 
 manage_token
@@ -1056,7 +1068,7 @@ if ! is_read_only_mode && [[ -n "${realmlist}" && "${realmlist}" != "null" ]]; t
   update_realmlist "${realmlist}"
 fi
 
-files_to_process="$(collect_core_files "${games_manifest}" "${game}" "${full}")"
+files_to_process="$(collect_core_files "${games_manifest}" "${game}" "${full}" "${quick}")"
 
 if [[ -z "${files_to_process}" ]]; then
   error 1 "No files found in manifest for game slug '${game}'."
