@@ -84,7 +84,7 @@ chmod +x "${mock_bin}/zipinfo"
 manifest_file="${test_root}/manifest.json"
 addons_file="${test_root}/addons.json"
 printf '{"success":true,"addons":[{"id":209,"name":"Elvui","description":"Custom interface","file_size_bytes":"100","updated_at":"2026-08-05T15:40:45.000Z"},{"id":212,"name":"Quest Helper","description":"Quest guidance","file_size_bytes":"100","updated_at":"2026-08-05T15:40:45.000Z"}]}' >"${addons_file}"
-printf '{"success":true,"data":{"common":{"files":[]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1","file_path_from_game_root":"Data/patch-test.MPQ","file_hash":"%s","option_slug":null},{"id":"2","file_path_from_game_root":"Data/enUS/realmlist.wtf","file_hash":"%s","option_slug":null}]}]}}' "${expected_b64}" "${realmlist_b64}" >"${manifest_file}"
+printf '{"success":true,"data":{"common":{"files":[{"id":"3","file_path_from_game_root":"Ebonhold/common-required.dat","file_hash":"%s","option_slug":null},{"id":"6","file_path_from_game_root":"Ebonhold/common-optional.dat","file_hash":"%s","option_slug":"optional"}]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1","file_path_from_game_root":"Data/patch-test.MPQ","file_hash":"%s","option_slug":null},{"id":"2","file_path_from_game_root":"Data/enUS/realmlist.wtf","file_hash":"%s","option_slug":null},{"id":"4","file_path_from_game_root":"Ebonhold/new-required.dat","file_hash":"%s","option_slug":null},{"id":"5","file_path_from_game_root":"Ebonhold/optional.dat","file_hash":"%s","option_slug":"optional"}]}]}}' "${expected_b64}" "${expected_b64}" "${expected_b64}" "${realmlist_b64}" "${expected_b64}" "${expected_b64}" >"${manifest_file}"
 
 symlink_client="${test_root}/symlink-client"
 mkdir -p "${symlink_client}/Data"
@@ -94,10 +94,20 @@ cp "${test_root}/expected-file" "${symlink_client}/Data/patch-test.MPQ"
 symlink_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${symlink_client}/ebonhold-launcher.sh" --dry-run)"
 [[ "${symlink_output}" == *"[OK]"* ]]
 [[ "${symlink_output}" == *"Data/patch-test.MPQ"* ]]
+[[ "${symlink_output}" == *"Ebonhold/common-required.dat"* ]]
+[[ "${symlink_output}" == *"Ebonhold/new-required.dat"* ]]
+[[ "${symlink_output}" != *"realmlist.wtf"* ]]
+[[ "${symlink_output}" != *"Ebonhold/common-optional.dat"* ]]
+[[ "${symlink_output}" != *"Ebonhold/optional.dat"* ]]
+full_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --full)"
+[[ "${full_output}" != *"realmlist.wtf"* ]]
+[[ "${full_output}" == *"Ebonhold/common-optional.dat"* ]]
+[[ "${full_output}" == *"Ebonhold/optional.dat"* ]]
 path_output="$(PATH="${symlink_client}:${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && ebonhold-launcher.sh --dry-run')"
 [[ "${path_output}" == *"[OK]"* ]]
 interpreter_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && bash launcher.sh --dry-run')"
-[[ "${interpreter_output}" == *"[OK]"* ]]
+[[ "${interpreter_output}" == *"Ebonhold/common-required.dat"* ]]
+[[ "${interpreter_output}" == *"Ebonhold/new-required.dat"* ]]
 
 status_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --status)"
 [[ "${status_output}" == *"Server test is online."* ]]
