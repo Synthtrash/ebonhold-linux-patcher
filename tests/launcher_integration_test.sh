@@ -151,6 +151,15 @@ PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FIL
 [[ ! -e "${test_root}/Data/enUS/realmlist.wtf" ]]
 [[ -f "${test_root}/Cache/WDB/enUS/cache.wdb" ]]
 
+mkdir -p "${test_root}/Data"
+cp "${test_root}/expected-file" "${test_root}/Data/patch-test.MPQ"
+printf 'stale lowercase copy' >"${test_root}/Data/patch-test.mpq"
+verify_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify || true)"
+[[ "${verify_output}" == *"[STALE]"* ]]
+[[ "${verify_output}" == *"patch-test.mpq"* ]]
+[[ -f "${test_root}/Data/patch-test.mpq" ]]
+[[ -f "${test_root}/Data/patch-test.MPQ" ]]
+
 printf '{"success":true,"data":{"common":{"files":[]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1","file_path_from_game_root":"../patch-escape","file_hash":"%s","option_slug":null}]}]}}' "${expected_b64}" >"${manifest_file}"
 if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet; then
   printf 'Path traversal manifest was accepted.\n' >&2
@@ -162,8 +171,14 @@ mkdir -p "${test_root}/Interface/AddOns/LegacyElvUI" "${test_root}/Interface/Add
 printf 'legacy' >"${test_root}/Interface/AddOns/LegacyElvUI/legacy.toc"
 printf 'shared' >"${test_root}/Interface/AddOns/SharedLibrary/shared.lua"
 printf '{"addons":{"209":{"name":"Elvui","updated_at":"2026-01-01T00:00:00.000Z","folders":["LegacyElvUI","SharedLibrary"]},"212":{"name":"Quest Helper","updated_at":"2026-01-01T00:00:00.000Z","folders":["SharedLibrary"]}}}' >"${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json"
+PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --quiet >/dev/null
+[[ ! -e "${test_root}/Data/patch-test.mpq" ]]
+[[ -f "${test_root}/Data/patch-test.MPQ" ]]
+printf 'stale lowercase copy' >"${test_root}/Data/patch-test.mpq"
+rm -f "${test_root}/Data/patch-test.MPQ"
 PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --quiet --addons=Elvui -- /usr/bin/touch "${test_root}/game-launched"
 [[ "$(<"${test_root}/Data/patch-test.MPQ")" == "updated game file" ]]
+[[ ! -e "${test_root}/Data/patch-test.mpq" ]]
 [[ "$(<"${test_root}/Interface/AddOns/ElvUI/ElvUI.toc")" == "## Title: ElvUI" ]]
 [[ ! -e "${test_root}/Interface/AddOns/LegacyElvUI" ]]
 [[ -f "${test_root}/Interface/AddOns/SharedLibrary/shared.lua" ]]
