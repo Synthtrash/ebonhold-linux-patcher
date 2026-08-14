@@ -19,6 +19,7 @@ addon_catalog=""
 addon_ids=()
 addon_update_ids=()
 addon_update_names=()
+declare -A manifest_dest_paths=()
 
 script_path="${0}"
 if [[ "${script_path}" != */* ]]; then
@@ -752,10 +753,50 @@ download_addons() {
   exec {addon_lock_fd}>&-
 }
 
+index_manifest_paths() {
+  local files_json="$1"
+  local path dest
+  manifest_dest_paths=()
+  while read -r file; do
+    [[ -z "${file}" ]] && continue
+    path="$(jq -r '.file_path_from_game_root' <<<"$file")"
+    dest="$(safe_destination "${path}")" || continue
+    manifest_dest_paths["${dest}"]=1
+  done <<<"$files_json"
+}
+
+find_case_variants() {
+  local dest="$1"
+  local dir base pattern variant
+  dir="$(dirname "${dest}")"
+  base="$(basename "${dest}")"
+  [[ -n "${base}" && -d "${dir}" ]] || return 0
+  pattern="$(printf '%s' "${base}" | sed 's/[][*?]/\\&/g')"
+  while IFS= read -r -d '' variant; do
+    [[ "${variant}" == "${dest}" ]] && continue
+    [[ -n "${manifest_dest_paths[${variant}]+x}" ]] && continue
+    printf '%s\n' "${variant}"
+  done < <(find "${dir}" -maxdepth 1 -type f -iname "${pattern}" -print0)
+}
+
+remove_case_variants() {
+  local dest="$1"
+  local variant removed=false
+  while IFS= read -r variant; do
+    [[ -z "${variant}" ]] && continue
+    rm -f -- "${variant}" || continue
+    printf '%s[STALE]%s Removed stale case-variant file: %s\n' "${YELLOW}" "${NC}" "${variant}"
+    removed=true
+  done < <(find_case_variants "${dest}")
+  [[ "${removed}" == "true" ]]
+}
+
 verify_files() {
   local files_json="$1"
   local mismatches=0 missing=0 ok=0 total=0
-  local path expected_b64 expected_md5 dest local_md5
+  local path expected_b64 expected_md5 dest local_md5 stale
+
+  index_manifest_paths "$files_json"
 
   printf '\nVerifying files...\n\n'
 
@@ -783,6 +824,10 @@ verify_files() {
       else
         printf '%s[OK]%s %s\n' "${GREEN}" "${NC}" "${path}"
         ok=$((ok + 1))
+        while IFS= read -r stale; do
+          [[ -z "${stale}" ]] && continue
+          printf '%s[STALE]%s Case-variant of %s detected: %s (running the launcher normally will remove it)\n' "${YELLOW}" "${NC}" "${path}" "${stale}"
+        done < <(find_case_variants "${dest}")
       fi
     fi
   done <<<"$files_json"
@@ -802,6 +847,9 @@ verify_files() {
 update_files() {
   local files_json="$1"
   local size_before=0 size_after=0 size_downloaded=0 current_size=0
+  local stale_dest
+
+  index_manifest_paths "$files_json"
 
   if [[ "${verify_only}" == "true" ]]; then
     verify_files "$files_json"
@@ -843,6 +891,9 @@ update_files() {
         download_needed=true
       else
         printf '%s[OK]%s %s matches MD5 signature: %s%s%s\n' "${GREEN}" "${NC}" "${path}" "${GREEN}" "${expected_md5}" "${NC}"
+        if ! is_read_only_mode && remove_case_variants "${dest}"; then
+          files_updated=true
+        fi
       fi
     fi
 
@@ -908,6 +959,14 @@ update_files() {
     error 1 "One or more downloads failed."
   fi
   files_updated=true
+
+  for task in "${download_tasks[@]}"; do
+    stale_dest="${task#*|}"
+    stale_dest="${stale_dest%%|*}"
+    if remove_case_variants "${stale_dest}"; then
+      files_updated=true
+    fi
+  done
 
   while read -r file; do
     [[ -z "${file}" ]] && continue

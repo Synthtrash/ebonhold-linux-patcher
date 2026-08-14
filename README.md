@@ -9,6 +9,7 @@ Updates and launches the Project Ebonhold game client on Linux.
 - Logs in via the Ebonhold API and caches your session token.
 - Checks all required common and game files against the manifest using MD5 hashes by default.
 - Downloads missing or mismatched files (4 concurrent downloads), verifies them, then replaces files atomically. Use `--full` to include optional files.
+- Removes stale files that differ only by case from the manifest path (e.g. a leftover `patch-4.mpq` next to `patch-4.MPQ`), which would otherwise shadow the updated file on case-sensitive filesystems.
 - Checks server status and updates `Data/enUS/realmlist.wtf`.
 - After a successful file update, clears cached `.wdb` files and creates `Cache/invalid` so the game rebuilds its cache.
 
