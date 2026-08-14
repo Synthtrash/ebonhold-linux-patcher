@@ -12,6 +12,7 @@ Updates and launches the Project Ebonhold game client on Linux.
 - Removes stale files that differ only by case from the manifest path (e.g. a leftover `patch-4.mpq` next to `patch-4.MPQ`), which would otherwise shadow the updated file on case-sensitive filesystems.
 - Checks server status and updates `Data/enUS/realmlist.wtf`.
 - After a successful file update, clears cached `.wdb` files and creates `Cache/invalid` so the game rebuilds its cache.
+- Removing addons (`--remove-addons`) moves their folders to `.ebonhold-removed-addons/` instead of deleting them, so a removal can be undone by moving the folders back.
 
 ---
 
@@ -45,6 +46,8 @@ chmod +x launcher.sh
 | `--list-addons` | List addons available from the official launcher catalog |
 | `--check-addons` | Check installed launcher addons and suggest available updates |
 | `--select-addons` | Interactively select addons to download |
+| `--remove-addons` | Interactively select installed launcher addons to remove |
+| `--remove-addons=LIST` | Remove comma-separated installed addon names or IDs |
 | `--addons=LIST` | Download comma-separated addon names or IDs, such as `--addons=Elvui,Details` |
 | `--quiet` | Suppress non-error output |
 | `--help` | Show this message |
