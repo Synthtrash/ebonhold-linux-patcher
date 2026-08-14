@@ -182,11 +182,26 @@ PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FIL
 [[ "$(<"${test_root}/Interface/AddOns/ElvUI/ElvUI.toc")" == "## Title: ElvUI" ]]
 [[ ! -e "${test_root}/Interface/AddOns/LegacyElvUI" ]]
 [[ -f "${test_root}/Interface/AddOns/SharedLibrary/shared.lua" ]]
+jq '.addons["209"].folders += ["SharedLibrary"]' "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json" >"${test_root}/Interface/AddOns/.ebonhold-launcher-addons.tmp" && mv "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.tmp" "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json"
+remove_shared_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --remove-addons='Quest Helper')"
+[[ "${remove_shared_output}" == *"[SKIP]"* ]]
+[[ -f "${test_root}/Interface/AddOns/SharedLibrary/shared.lua" ]]
+[[ -z "$(jq -r '.addons["212"] // empty' "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json")" ]]
+[[ -n "$(jq -r '.addons["209"] // empty' "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json")" ]]
 addon_check_after_install="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --check-addons)"
 [[ "${addon_check_after_install}" == *"[CURRENT]"* ]]
 rm -f "${test_root}/Interface/AddOns/ElvUI/ElvUI.toc"
 addon_check_after_removal="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --check-addons)"
 [[ "${addon_check_after_removal}" == *"[UPDATE AVAILABLE]"* ]]
+remove_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --remove-addons=Elvui)"
+[[ "${remove_output}" == *"[REMOVED]"* ]]
+[[ ! -e "${test_root}/Interface/AddOns/ElvUI" ]]
+backup_found=false
+for backup in "${test_root}"/.ebonhold-removed-addons/Elvui-*; do
+  [[ -d "${backup}/ElvUI" ]] && backup_found=true
+done
+[[ "${backup_found}" == "true" ]]
+[[ -z "$(jq -r '.addons["209"] // empty' "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json")" ]]
 [[ -f "${test_root}/game-launched" ]]
 [[ ! -e "${test_root}/Cache/WDB/enUS/cache.wdb" ]]
 [[ -f "${test_root}/Cache/invalid" ]]

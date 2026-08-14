@@ -20,6 +20,8 @@ addon_ids=()
 addon_update_ids=()
 addon_update_names=()
 declare -A manifest_dest_paths=()
+remove_addons=""
+remove_addons_only=false
 
 script_path="${0}"
 if [[ "${script_path}" != */* ]]; then
@@ -753,6 +755,161 @@ download_addons() {
   exec {addon_lock_fd}>&-
 }
 
+remove_addon_by_id() {
+  local addon_id="$1"
+  local addon_name folder directory backup_root backup_dir suffix state_dir temporary_state
+  local moved=false skipped=false
+
+  addon_name="$(jq -r --arg id "${addon_id}" '.addons[$id].name // empty' "${addon_state_file}" 2>/dev/null)"
+  [[ -n "${addon_name}" ]] || error 1 "Addon '${addon_id}' is not installed via the launcher."
+
+  backup_root="${targetdir}/.ebonhold-removed-addons"
+  backup_dir="${backup_root}/${addon_name}-$(date +%Y%m%d-%H%M%S)"
+  suffix=1
+  while [[ -e "${backup_dir}" ]]; do
+    backup_dir="${backup_root}/${addon_name}-$(date +%Y%m%d-%H%M%S)-${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  while read -r folder; do
+    [[ -z "${folder}" || "${folder}" == *"/"* || "${folder}" == "." || "${folder}" == ".." || "${folder}" =~ [[:cntrl:]] ]] && continue
+    directory="${targetdir}/Interface/AddOns/${folder}"
+    [[ -d "${directory}" ]] || continue
+    [[ ! -L "${directory}" ]] || error 1 "Refusing symlinked addon folder: ${directory}."
+    if addon_folder_is_shared "${addon_id}" "${folder}"; then
+      printf '%s[SKIP]%s %s is also used by another addon; leaving it in place.\n' "${YELLOW}" "${NC}" "${directory}"
+      skipped=true
+      continue
+    fi
+    mkdir -p "${backup_dir}" || error 1 "Could not create backup directory for ${addon_name}."
+    mv "${directory}" "${backup_dir}/${folder}" || error 1 "Could not move addon folder ${directory}."
+    printf '%s[REMOVED]%s %s\n' "${GREEN}" "${NC}" "${directory}"
+    moved=true
+  done < <(jq -r --arg id "${addon_id}" '.addons[$id].folders[]? // empty' "${addon_state_file}" 2>/dev/null)
+
+  if [[ "${moved}" == "false" ]] && directory="$(addon_directory "${addon_name}")" && [[ ! -L "${directory}" ]]; then
+    mkdir -p "${backup_dir}" || error 1 "Could not create backup directory for ${addon_name}."
+    mv "${directory}" "${backup_dir}/" || error 1 "Could not move addon folder ${directory}."
+    printf '%s[REMOVED]%s %s\n' "${GREEN}" "${NC}" "${directory}"
+    moved=true
+  fi
+
+  state_dir="$(dirname "${addon_state_file}")"
+  if [[ -f "${addon_state_file}" ]]; then
+    temporary_state="$(mktemp "${state_dir}/.ebonhold-launcher-addons.XXXXXX")" || error 1 "Could not update addon state."
+    if ! jq --arg id "${addon_id}" 'del(.addons[$id])' "${addon_state_file}" >"${temporary_state}"; then
+      rm -f "${temporary_state}"
+      error 1 "Could not update addon state for ${addon_name}."
+    fi
+    mv -f "${temporary_state}" "${addon_state_file}" || error 1 "Could not save addon state."
+  fi
+
+  if [[ "${moved}" == "true" ]]; then
+    printf '  Moved to %s\n' "${backup_dir}"
+    printf '  To restore it, move the folders back or reinstall with --addons=%s\n' "${addon_name}"
+  elif [[ "${skipped}" == "true" ]]; then
+    printf '%s[REMOVED]%s %s launcher record removed; shared folders were left in place.\n' "${YELLOW}" "${NC}" "${addon_name}"
+  else
+    printf '%s[REMOVED]%s %s files were already gone; removed the launcher record.\n' "${YELLOW}" "${NC}" "${addon_name}"
+  fi
+}
+
+resolve_addon_removals() {
+  local requested="$1"
+  local addon id installed_summary
+  local -a requested_addons=() resolved=()
+
+  IFS=',' read -r -a requested_addons <<<"${requested}"
+  for addon in "${requested_addons[@]}"; do
+    addon="${addon#"${addon%%[![:space:]]*}"}"
+    addon="${addon%"${addon##*[![:space:]]}"}"
+    [[ -n "${addon}" ]] || continue
+    id="$(jq -r --arg addon "${addon}" '
+      [.addons | to_entries[] | select((.key | tostring) == $addon or (.value.name | ascii_downcase) == ($addon | ascii_downcase)) | .key]
+      | if length == 1 then .[0] else empty end' "${addon_state_file}" 2>/dev/null)"
+    if [[ -z "${id}" ]]; then
+      installed_summary="$(jq -r '.addons[] | .name' "${addon_state_file}" 2>/dev/null | tr '\n' ', ' | sed 's/, $//')"
+      [[ -n "${installed_summary}" ]] || installed_summary="none"
+      error 1 "Addon '${addon}' is not installed via the launcher.\nInstalled: ${installed_summary}"
+    fi
+    [[ " ${resolved[*]} " == *" ${id} "* ]] || resolved+=("${id}")
+  done
+  [[ ${#resolved[@]} -gt 0 ]] || error 1 "No addons were selected for removal."
+
+  for id in "${resolved[@]}"; do
+    remove_addon_by_id "${id}"
+  done
+}
+
+remove_addons_interactively() {
+  local -a installed_ids=() installed_names=() zenity_args
+  local addon_id addon_name ids_csv="" selection number i
+
+  while IFS=$'\t' read -r addon_id addon_name; do
+    [[ -n "${addon_id}" ]] || continue
+    installed_ids+=("${addon_id}")
+    installed_names+=("${addon_name}")
+  done < <(jq -r '.addons | to_entries[]? | [.key, .value.name] | @tsv' "${addon_state_file}" 2>/dev/null)
+
+  [[ ${#installed_ids[@]} -gt 0 ]] || {
+    printf 'No addons installed via the launcher are recorded.\n'
+    return 0
+  }
+
+  if [[ "${GUI}" == "true" ]]; then
+    zenity_args=(--list --checklist --title="Ebonhold Addons" --text="Select addons to remove" --column="Remove" --column="Name" --separator=",")
+    for i in "${!installed_ids[@]}"; do
+      zenity_args+=(FALSE "${installed_names[$i]}")
+    done
+    selection="$(zenity "${zenity_args[@]}")" || exit 0
+    ids_csv="${selection}"
+  else
+    printf 'Addons installed via the launcher:\n'
+    for i in "${!installed_ids[@]}"; do
+      printf '  %d) %s\n' "$((i + 1))" "${installed_names[$i]}"
+    done
+    selection="$(prompt_text "Ebonhold Addons" "Enter the numbers to remove, separated by commas (e.g. 1,3)")" || exit 0
+    while IFS=',' read -r number; do
+      number="${number#"${number%%[![:space:]]*}"}"
+      number="${number%"${number##*[![:space:]]}"}"
+      [[ -n "${number}" ]] || continue
+      [[ "${number}" =~ ^[0-9]+$ && "${number}" -ge 1 && "${number}" -le ${#installed_ids[@]} ]] || error 1 "Invalid selection: ${number}"
+      if [[ -z "${ids_csv}" ]]; then
+        ids_csv="${installed_ids[$((number - 1))]}"
+      else
+        ids_csv+=",${installed_ids[$((number - 1))]}"
+      fi
+    done <<<"${selection}"
+  fi
+
+  [[ -n "${ids_csv}" ]] || {
+    printf 'Nothing selected.\n'
+    return 0
+  }
+  resolve_addon_removals "${ids_csv}"
+}
+
+remove_addons_from_client() {
+  local requested="$1"
+  local addon_lock_fd
+  local addons_dir="${targetdir}/Interface/AddOns"
+
+  command -v flock >/dev/null 2>&1 || error 1 "Removing addons requires flock."
+  mkdir -p "${addons_dir}" || error 1 "Could not create addon directory."
+  [[ ! -L "${addons_dir}" ]] || error 1 "Refusing symlinked addon directory: ${addons_dir}."
+  exec {addon_lock_fd}>"${addons_dir}/.ebonhold-launcher.lock"
+  flock "${addon_lock_fd}" || error 1 "Could not lock addon removal."
+
+  if [[ -n "${requested}" ]]; then
+    resolve_addon_removals "${requested}"
+  else
+    remove_addons_interactively
+  fi
+
+  flock -u "${addon_lock_fd}"
+  exec {addon_lock_fd}>&-
+}
+
 index_manifest_paths() {
   local files_json="$1"
   local path dest
@@ -1007,7 +1164,10 @@ clearCache() {
   mkdir -p "${cache_dir}" || return 1
   deleted="$(find "${cache_dir}" -iname '*.wdb' -type f -print -delete)" || return 1
   touch "${cache_dir}/invalid" || return 1
-  [[ -n "${deleted}" ]] && debug "Update completed, cleared local caches:\n${deleted}"
+  if [[ -n "${deleted}" ]]; then
+    debug "Update completed, cleared local caches:\n${deleted}"
+  fi
+  return 0
 }
 
 filtered_args=()
@@ -1054,6 +1214,12 @@ for arg in "${@}"; do
   --select-addons)
     select_addons=true
     ;;
+  --remove-addons)
+    remove_addons_only=true
+    ;;
+  --remove-addons=*)
+    remove_addons="${arg#--remove-addons=}"
+    ;;
   --dry-run)
     dry_run=true
     debug "Dry-run mode enabled"
@@ -1072,6 +1238,9 @@ Options:
   --list-addons     Show addons available for the selected game and exit
   --check-addons    Show installed addon update recommendations and exit
   --select-addons   Interactively select addons to download
+  --remove-addons   Interactively select installed addons to remove
+  --remove-addons=LIST
+                    Remove comma-separated installed addon names or IDs
   --addons=LIST     Download comma-separated addon names or IDs
   --quiet           Suppress non-error output
   --help            Show this help message
@@ -1120,6 +1289,12 @@ if [[ "${select_addons}" == "true" ]]; then
 elif [[ -n "${addons}" ]]; then
   fetch_addon_catalog
   resolve_addons "${addons}"
+fi
+
+if [[ "${remove_addons_only}" == "true" || -n "${remove_addons}" ]]; then
+  is_read_only_mode && error 1 "--remove-addons cannot be combined with --verify or --dry-run."
+  remove_addons_from_client "${remove_addons}"
+  exit 0
 fi
 
 realmlist="$(jq -r --arg slug "${game}" '.data.games[] | select(.slug == $slug) | .realmlist' <<<"${games_manifest}")"
