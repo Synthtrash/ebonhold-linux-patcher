@@ -119,6 +119,18 @@ if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_
   printf '%s\n' '--quick and --full were accepted together.' >&2
   exit 1
 fi
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify --dry-run >/dev/null 2>&1; then
+  printf '%s\n' '--verify and --dry-run were accepted together.' >&2
+  exit 1
+fi
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --select-addons --addons=Elvui >/dev/null 2>&1; then
+  printf '%s\n' '--select-addons and --addons were accepted together.' >&2
+  exit 1
+fi
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --status --quick >/dev/null 2>&1; then
+  printf '%s\n' '--status and --quick were accepted together.' >&2
+  exit 1
+fi
 path_output="$(PATH="${symlink_client}:${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && ebonhold-launcher.sh --dry-run')"
 [[ "${path_output}" == *"[OK]"* ]]
 interpreter_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && bash launcher.sh --dry-run')"
@@ -178,11 +190,17 @@ quiet_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}"
 mkdir -p "${test_root}/Data"
 cp "${test_root}/expected-file" "${test_root}/Data/patch-test.MPQ"
 printf 'stale lowercase copy' >"${test_root}/Data/patch-test.mpq"
-verify_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify || true)"
+verify_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify 2>&1 || true)"
 [[ "${verify_output}" == *"[STALE]"* ]]
 [[ "${verify_output}" == *"patch-test.mpq"* ]]
 [[ -f "${test_root}/Data/patch-test.mpq" ]]
 [[ -f "${test_root}/Data/patch-test.MPQ" ]]
+
+printf '{"success":true,"data":{"common":{"files":[]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1&evil","file_path_from_game_root":"Data/patch-test.MPQ","file_hash":"%s","option_slug":null}]}]}}' "${expected_b64}" >"${manifest_file}"
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet; then
+  printf 'Malformed manifest file ID was accepted.\n' >&2
+  exit 1
+fi
 
 printf '{"success":true,"data":{"common":{"files":[]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1","file_path_from_game_root":"../patch-escape","file_hash":"%s","option_slug":null}]}]}}' "${expected_b64}" >"${manifest_file}"
 if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet; then
@@ -191,6 +209,10 @@ if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_
 fi
 
 printf '{"success":true,"data":{"common":{"files":[]},"games":[{"slug":"roguelike-prod","realmlist":"test.realm","files":[{"id":"1","file_path_from_game_root":"Data/patch-test.MPQ","file_hash":"%s","option_slug":null},{"id":"2","file_path_from_game_root":"Data/enUS/realmlist.wtf","file_hash":"%s","option_slug":null}]}]}}' "${expected_b64}" "${realmlist_b64}" >"${manifest_file}"
+rm -f "${test_root}/Data/patch-test.MPQ"
+quiet_verify_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify --quiet 2>&1 || true)"
+[[ "${quiet_verify_output}" == *"[MISSING]"* ]]
+cp "${test_root}/expected-file" "${test_root}/Data/patch-test.MPQ"
 mkdir -p "${test_root}/Interface/AddOns/LegacyElvUI" "${test_root}/Interface/AddOns/SharedLibrary"
 printf 'legacy' >"${test_root}/Interface/AddOns/LegacyElvUI/legacy.toc"
 printf 'shared' >"${test_root}/Interface/AddOns/SharedLibrary/shared.lua"
@@ -200,12 +222,17 @@ PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FIL
 [[ -f "${test_root}/Data/patch-test.MPQ" ]]
 printf 'stale lowercase copy' >"${test_root}/Data/patch-test.mpq"
 rm -f "${test_root}/Data/patch-test.MPQ"
-PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --quiet --addons=Elvui -- /usr/bin/touch "${test_root}/game-launched"
+quiet_update_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --quiet --addons=Elvui -- /usr/bin/touch "${test_root}/game-launched")"
+[[ -z "${quiet_update_output}" ]]
 [[ "$(<"${test_root}/Data/patch-test.MPQ")" == "updated game file" ]]
 [[ ! -e "${test_root}/Data/patch-test.mpq" ]]
 [[ "$(<"${test_root}/Interface/AddOns/ElvUI/ElvUI.toc")" == "## Title: ElvUI" ]]
 [[ ! -e "${test_root}/Interface/AddOns/LegacyElvUI" ]]
 [[ -f "${test_root}/Interface/AddOns/SharedLibrary/shared.lua" ]]
+MOCK_ARGS_FILE="${test_root}/passthrough.args" PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --quiet -- /bin/sh -c 'printf "%s\n" "$@" >"$MOCK_ARGS_FILE"' sh --quiet --game=forwarded
+mapfile -t passthrough_args <"${test_root}/passthrough.args"
+[[ "${passthrough_args[0]}" == "--quiet" ]]
+[[ "${passthrough_args[1]}" == "--game=forwarded" ]]
 jq '.addons["209"].folders += ["SharedLibrary"]' "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json" >"${test_root}/Interface/AddOns/.ebonhold-launcher-addons.tmp" && mv "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.tmp" "${test_root}/Interface/AddOns/.ebonhold-launcher-addons.json"
 remove_shared_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --remove-addons='Quest Helper')"
 [[ "${remove_shared_output}" == *"[SKIP]"* ]]

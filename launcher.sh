@@ -37,7 +37,6 @@ if [[ "${script_path}" != */* ]]; then
 fi
 scriptdir="$(dirname "${script_path}")"
 targetdir="$(realpath -m "${scriptdir}")"
-target_root="$(realpath -m "${targetdir}")"
 
 login_api="https://api.project-ebonhold.com/api/auth/login"
 games_api="https://api.project-ebonhold.com/api/launcher/games"
@@ -62,8 +61,8 @@ safe_destination() {
     return 1
   fi
 
-  destination="$(realpath -m "${target_root}/${path}")"
-  [[ "${destination}" == "${target_root}/"* ]] || return 1
+  destination="$(realpath -m "${targetdir}/${path}")"
+  [[ "${destination}" == "${targetdir}/"* ]] || return 1
   printf '%s' "${destination}"
 }
 
@@ -144,7 +143,7 @@ manage_token() {
   debug "No valid token found. Please log in."
 
   if [[ "${GUI}" == "false" && "${interactiveShell}" == "false" ]]; then
-    error 1 "Cannot log in without a terminal or display. Run the launcher interactively once, or install zenity."
+    error 1 "Cannot log in without a terminal or display. Run the launcher interactively once, or provide a graphical display."
   fi
 
   user="$(prompt_text "Ebonhold Login" "Enter your username:")" || error 1 "Cannot prompt for username: no terminal and no display available. Run interactively or install zenity."
@@ -971,7 +970,7 @@ remove_case_variants() {
   while IFS= read -r variant; do
     [[ -z "${variant}" ]] && continue
     rm -f -- "${variant}" || continue
-    printf '%s[STALE]%s Removed stale case-variant file: %s\n' "${YELLOW}" "${NC}" "${variant}"
+    [[ "${quiet}" == "false" ]] && printf '%s[STALE]%s Removed stale case-variant file: %s\n' "${YELLOW}" "${NC}" "${variant}"
     removed=true
   done < <(find_case_variants "${dest}")
   [[ "${removed}" == "true" ]]
@@ -991,28 +990,28 @@ verify_files() {
     path="$(jq -r '.file_path_from_game_root' <<<"$file")"
     expected_b64="$(jq -r '.file_hash' <<<"$file")"
     if ! dest="$(safe_destination "${path}")" || ! expected_md5="$(manifest_md5 "${expected_b64}")"; then
-      printf '%s[INVALID]%s Manifest entry for %s is unsafe or has an invalid checksum.\n' "${RED}" "${NC}" "${path}"
+      printf '%s[INVALID]%s Manifest entry for %s is unsafe or has an invalid checksum.\n' "${RED}" "${NC}" "${path}" >&2
       mismatches=$((mismatches + 1))
       continue
     fi
     total=$((total + 1))
 
     if [[ ! -f "${dest}" ]]; then
-      printf '%s[MISSING]%s %s\n' "${RED}" "${NC}" "${path}"
+      printf '%s[MISSING]%s %s\n' "${RED}" "${NC}" "${path}" >&2
       missing=$((missing + 1))
     else
       local_md5="$(md5sum "${dest}" | cut -d' ' -f1)"
       if [[ "${local_md5}" != "${expected_md5}" ]]; then
-        printf '%s[MISMATCH]%s %s\n' "${RED}" "${NC}" "${path}"
-        printf '  Expected: %s\n' "${expected_md5}"
-        printf '  Local:    %s\n' "${local_md5}"
+        printf '%s[MISMATCH]%s %s\n' "${RED}" "${NC}" "${path}" >&2
+        printf '  Expected: %s\n' "${expected_md5}" >&2
+        printf '  Local:    %s\n' "${local_md5}" >&2
         mismatches=$((mismatches + 1))
       else
         printf '%s[OK]%s %s\n' "${GREEN}" "${NC}" "${path}"
         ok=$((ok + 1))
         while IFS= read -r stale; do
           [[ -z "${stale}" ]] && continue
-          printf '%s[STALE]%s Case-variant of %s detected: %s (running the launcher normally will remove it)\n' "${YELLOW}" "${NC}" "${path}" "${stale}"
+          printf '%s[STALE]%s Case-variant of %s detected: %s (running the launcher normally will remove it)\n' "${YELLOW}" "${NC}" "${path}" "${stale}" >&2
         done < <(find_case_variants "${dest}")
       fi
     fi
@@ -1066,7 +1065,7 @@ update_files() {
     expected_b64="$(jq -r '.file_hash' <<<"$file")"
     dest="$(safe_destination "${path}")" || error 1 "Unsafe manifest path: ${path}"
     expected_md5="$(manifest_md5 "${expected_b64}")" || error 1 "Invalid manifest checksum for: ${path}"
-    [[ -n "${id}" && "${id}" != "null" && "${id}" != *"|"* ]] || error 1 "Invalid manifest file ID for: ${path}"
+    [[ "${id}" =~ ^[1-9][0-9]*$ ]] || error 1 "Invalid manifest file ID for: ${path}"
 
     download_needed=false
     if [[ ! -f "${dest}" ]]; then
@@ -1287,7 +1286,7 @@ Options:
   --quiet           Suppress routine output; warnings and errors remain
   --help            Show this help message
 
-Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet %command%
+Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet -- %command%
 EOF
     exit 0
     ;;
@@ -1304,8 +1303,28 @@ if [[ "${quick}" == "true" && "${full}" == "true" ]]; then
   error 1 "--quick and --full cannot be used together."
 fi
 
+if [[ "${verify_only}" == "true" && "${dry_run}" == "true" ]]; then
+  error 1 "--verify and --dry-run cannot be used together."
+fi
+
+if [[ "${select_addons}" == "true" && -n "${addons}" ]]; then
+  error 1 "--select-addons and --addons cannot be used together."
+fi
+
 if [[ "${verify_only}" == "true" && ("${select_addons}" == "true" || -n "${addons}") ]]; then
   error 1 "--verify cannot be combined with --select-addons or --addons."
+fi
+
+if [[ "${status_only}" == "true" && ("${verify_only}" == "true" || "${dry_run}" == "true" || "${quick}" == "true" || "${full}" == "true" || "${list_addons_only}" == "true" || "${check_addons_only}" == "true" || "${select_addons}" == "true" || "${remove_addons_only}" == "true" || -n "${addons}" || -n "${remove_addons}" || $# -gt 0) ]]; then
+  error 1 "--status cannot be combined with update, addon, or game-launch options."
+fi
+
+if [[ ("${list_addons_only}" == "true" || "${check_addons_only}" == "true") && ("${status_only}" == "true" || "${verify_only}" == "true" || "${dry_run}" == "true" || "${quick}" == "true" || "${full}" == "true" || "${list_addons_only}" == "true" && "${check_addons_only}" == "true" || "${select_addons}" == "true" || "${remove_addons_only}" == "true" || -n "${addons}" || -n "${remove_addons}" || $# -gt 0) ]]; then
+  error 1 "Addon report modes cannot be combined with update, addon, or game-launch options."
+fi
+
+if [[ ("${remove_addons_only}" == "true" || -n "${remove_addons}") && ("${status_only}" == "true" || "${verify_only}" == "true" || "${dry_run}" == "true" || "${quick}" == "true" || "${full}" == "true" || "${list_addons_only}" == "true" || "${check_addons_only}" == "true" || "${select_addons}" == "true" || -n "${addons}" || $# -gt 0) ]]; then
+  error 1 "Addon removal cannot be combined with update, addon, or game-launch options."
 fi
 
 manage_token
