@@ -31,8 +31,8 @@ if [[ "${script_path}" != */* ]]; then
   elif [[ -f "${script_path}" ]]; then
     script_path="./${script_path}"
   else
-      printf 'Could not determine launcher location.\n' >&2
-      exit 1
+    printf 'Could not determine launcher location.\n' >&2
+    exit 1
   fi
 fi
 scriptdir="$(dirname "${script_path}")"
@@ -76,11 +76,43 @@ manifest_md5() {
   printf '%s' "${checksum,,}"
 }
 
+fetch_games_manifest() {
+  local token="$1"
+  local response=""
+
+  games_http_code=""
+  games_error=""
+  if ! response="$(curl -sS --connect-timeout 10 --max-time 60 -w $'\n%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H "User-Agent: EbonholdLauncher/1.0" \
+    -H "Accept: application/json" \
+    -H "X-Client-Id: EbonholdLauncher" \
+    -H "Origin: https://project-ebonhold.com" \
+    -H "Referer: https://project-ebonhold.com/download" \
+    "${games_api}")"; then
+    games_error="Network request failed."
+    return 1
+  fi
+
+  games_http_code="${response##*$'\n'}"
+  response="${response%$'\n'*}"
+  if [[ ! "${games_http_code}" =~ ^2[0-9][0-9]$ ]] ||
+    ! jq -e '.success == true and (.data.games | type == "array")' <<<"${response}" >/dev/null 2>&1; then
+    games_error="$(jq -r '.error // .message // empty' <<<"${response}" 2>/dev/null)"
+    [[ -n "${games_error}" ]] || games_error="HTTP ${games_http_code:-unknown}"
+    [[ "${games_http_code}" == "401" || "${games_http_code}" == "403" ]] && return 2
+    return 1
+  fi
+
+  games_manifest="${response}"
+  return 0
+}
+
 manage_token() {
   local token=""
-  local games_response=""
   local user=""
   local pass=""
+  local manifest_result=0
 
   if [[ -f "${token_file}" ]]; then
     token="$(<"${token_file}")"
@@ -93,24 +125,19 @@ manage_token() {
 
   if [[ -n "${token}" ]]; then
     debug "Auth token found, verifying token."
-    games_response="$(curl -s --connect-timeout 10 --max-time 60 \
-      -H "Authorization: Bearer ${token}" \
-      -H "User-Agent: EbonholdLauncher/1.0" \
-      -H "Accept: application/json" \
-      -H "X-Client-Id: EbonholdLauncher" \
-      -H "Origin: https://project-ebonhold.com" \
-      -H "Referer: https://project-ebonhold.com/download" \
-      "${games_api}")"
-    if [[ -z "${games_response}" || "${games_response}" == "null" ]] || jq -e '.success == false' <<<"${games_response}" >/dev/null 2>&1; then
-      debug "Token invalid or expired. Clearing session."
-      is_read_only_mode || rm -f "${token_file}"
-      token=""
-      games_response=""
-    else
+    if fetch_games_manifest "${token}"; then
       debug "Token verified successfully."
       authToken="${token}"
-      games_manifest="${games_response}"
       return 0
+    else
+      manifest_result=$?
+      if [[ ${manifest_result} -eq 2 ]]; then
+        debug "Token invalid or expired. Clearing session."
+        is_read_only_mode || rm -f "${token_file}"
+        token=""
+      else
+        error 1 "Failed to fetch games manifest (HTTP ${games_http_code:-unknown}).\n${games_error}"
+      fi
     fi
   fi
 
@@ -121,7 +148,7 @@ manage_token() {
 
   debug "Posting credentials to authentication portal..."
   session="$(jq -n --arg username "${user}" --arg password "${pass}" \
-      '{username: $username, password: $password, rememberMe: true}' |
+    '{username: $username, password: $password, rememberMe: true}' |
     curl -s --connect-timeout 10 --max-time 60 -X POST -w "\n%{http_code}" \
       -H "Content-Type: application/json" \
       -H "User-Agent: EbonholdLauncher/1.0" \
@@ -154,21 +181,12 @@ manage_token() {
     debug "Secure auth token serialized locally (permissions: 600)."
   fi
 
-  games_response="$(curl -s --connect-timeout 10 --max-time 60 \
-    -H "Authorization: Bearer ${token}" \
-    -H "User-Agent: EbonholdLauncher/1.0" \
-    -H "Accept: application/json" \
-    -H "X-Client-Id: EbonholdLauncher" \
-    -H "Origin: https://project-ebonhold.com" \
-    -H "Referer: https://project-ebonhold.com/download" \
-    "${games_api}")"
-  if [[ -z "${games_response}" || "${games_response}" == "null" ]] || jq -e '.success == false' <<<"${games_response}" >/dev/null 2>&1; then
-    error 1 "Failed to fetch games manifest with new token. Please try again."
+  if ! fetch_games_manifest "${token}"; then
+    error 1 "Failed to fetch games manifest (HTTP ${games_http_code:-unknown}).\n${games_error}"
   fi
 
   unset user pass
   authToken="${token}"
-  games_manifest="${games_response}"
   debug "Authentication successful."
 }
 
@@ -182,9 +200,6 @@ else
   GUI="false"
 fi
 [[ -x "$(command -v zenity)" ]] || GUI="false"
-if [[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]]; then
-  error 1 "Cannot run in non-interactive mode without a display. Install zenity or run interactively first."
-fi
 
 BLUE=$'\033[0;34m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' GREEN=$'\033[0;32m' NC=$'\033[0m'
 
@@ -210,6 +225,10 @@ error() {
   fi
   [[ "${exit_code}" -ge "1" ]] && exit "${exit_code}"
 }
+
+if [[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]]; then
+  error 1 "Cannot run in non-interactive mode without a display. Install zenity or run interactively first."
+fi
 
 prompt_text() {
   local title="${1}" text="${2}"
@@ -580,7 +599,10 @@ check_addon_updates() {
       continue
     fi
 
-    local_mtime="$(while read -r directory; do find "${directory}" -type f -printf '%T@\n'; done <<<"${directories}" | sort -nr | { IFS= read -r first; printf '%s' "${first}"; })"
+    local_mtime="$(while read -r directory; do find "${directory}" -type f -printf '%T@\n'; done <<<"${directories}" | sort -nr | {
+      IFS= read -r first
+      printf '%s' "${first}"
+    })"
     if [[ -n "${state_updated_at}" ]]; then
       local_mtime="$(date -d "${state_updated_at}" +%s 2>/dev/null)"
     fi
@@ -602,7 +624,10 @@ prompt_addon_updates() {
   local answer
 
   [[ ${#addon_update_ids[@]} -gt 0 ]] || return 0
-  printf '\nUpdates are available for: %s\n' "$(IFS=', '; printf '%s' "${addon_update_names[*]}")"
+  printf '\nUpdates are available for: %s\n' "$(
+    IFS=', '
+    printf '%s' "${addon_update_names[*]}"
+  )"
   read -r -p 'Install updates now? [y/N] ' answer
   case "${answer}" in
   [Yy] | [Yy][Ee][Ss])
@@ -717,7 +742,10 @@ download_addons() {
   [[ ! -L "${addons_dir}" ]] || error 1 "Refusing symlinked addon directory: ${addons_dir}."
   exec {addon_lock_fd}>"${addons_dir}/.ebonhold-launcher.lock"
   flock "${addon_lock_fd}" || error 1 "Could not lock addon installation."
-  ids="$(IFS=,; printf '%s' "${addon_ids[*]}")"
+  ids="$(
+    IFS=,
+    printf '%s' "${addon_ids[*]}"
+  )"
   response="$(curl -s --connect-timeout 10 --max-time 60 \
     -H "Authorization: Bearer ${authToken}" \
     -H "User-Agent: EbonholdLauncher/1.0" \
@@ -1003,7 +1031,7 @@ verify_files() {
 
 update_files() {
   local files_json="$1"
-  local size_before=0 size_after=0 size_downloaded=0 current_size=0
+  local size_before=0 size_after=0 current_size=0
   local stale_dest
 
   index_manifest_paths "$files_json"
@@ -1202,6 +1230,9 @@ for arg in "${@}"; do
   --status)
     status_only=true
     ;;
+  --game=*)
+    game="${arg#--game=}"
+    ;;
   --addons=*)
     addons="${arg#--addons=}"
     ;;
@@ -1235,6 +1266,7 @@ Options:
   --quick           Check only required game patch files
   --full            Update all common and game files, including optional files
   --status          Show realm status and exit
+  --game=SLUG       Select a game from the launcher manifest
   --list-addons     Show addons available for the selected game and exit
   --check-addons    Show installed addon update recommendations and exit
   --select-addons   Interactively select addons to download
@@ -1270,8 +1302,16 @@ if [[ "${status_only}" == "true" ]]; then
   exit 0
 fi
 
-if ! jq -e --arg slug "${game}" '.data.games[] | select(.slug == $slug)' <<<"${games_manifest}" >/dev/null 2>&1; then
-  error 1 "Game slug '${game}' not found in manifest. Available: $(jq -r '.data.games[].slug' <<<"${games_manifest}" | tr '\n' ' ')"
+if [[ -z "${game}" ]]; then
+  mapfile -t available_games < <(jq -r '.data.games[]?.slug' <<<"${games_manifest}")
+  if [[ ${#available_games[@]} -eq 1 ]]; then
+    game="${available_games[0]}"
+    debug "Automatically selected game '${game}'."
+  else
+    error 1 "No game selected. Use --game=SLUG. Available: $(printf '%s ' "${available_games[@]}")"
+  fi
+elif ! jq -e --arg slug "${game}" '.data.games[] | select(.slug == $slug)' <<<"${games_manifest}" >/dev/null 2>&1; then
+  error 1 "Game slug '${game}' not found in manifest. Available: $(jq -r '.data.games[]?.slug' <<<"${games_manifest}" | tr '\n' ' ')"
 fi
 
 if [[ "${list_addons_only}" == "true" ]]; then

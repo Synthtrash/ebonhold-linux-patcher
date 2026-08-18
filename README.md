@@ -36,13 +36,14 @@ chmod +x launcher.sh
 ### Flags
 
 | Flag | Description |
-|------|-------------|
+| ------ | ------------- |
 | `--debug` | Enable verbose output |
 | `--verify` | Check files against manifest without changing client files, cache, realmlist, or token |
 | `--dry-run` | Show downloads that would be needed without changing client files, cache, realmlist, or token |
 | `--quick` | Check only required game patch files, matching the previous default behavior |
 | `--full` | Check and update all common and game files, including optional files |
 | `--status` | Show the authenticated realm status and exit |
+| `--game=SLUG` | Select a game from the launcher manifest (default: `roguelike-prod`) |
 | `--list-addons` | List addons available from the official launcher catalog |
 | `--check-addons` | Check installed launcher addons and suggest available updates |
 | `--select-addons` | Interactively select addons to download |
@@ -52,7 +53,7 @@ chmod +x launcher.sh
 | `--quiet` | Suppress non-error output |
 | `--help` | Show this message |
 
-When run interactively without game arguments, the launcher checks installed addons after updating and offers to install available updates. Steam and other passthrough launches never prompt.
+When run interactively without game arguments, the launcher checks installed addons after updating and offers to install available updates. Steam and other passthrough launches never prompt. Use `--game=roguelike` for the PTR manifest.
 
 ### Steam (non-Steam game)
 
