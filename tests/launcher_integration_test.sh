@@ -31,7 +31,12 @@ for ((i = 1; i <= $#; i++)); do
   [[ "${!i}" == http* ]] && url="${!i}"
 done
 if [[ "${url}" == *"/games" ]]; then
-  printf '%s' "$(<"${MOCK_MANIFEST_FILE}")"
+  if [[ -n "${MOCK_GAMES_RESPONSE:-}" ]]; then
+    printf '%s' "${MOCK_GAMES_RESPONSE}"
+  else
+    printf '%s' "$(<"${MOCK_MANIFEST_FILE}")"
+  fi
+  printf '\n%s' "${MOCK_GAMES_HTTP_CODE:-200}"
 elif [[ "${url}" == *"/download?file_ids="* ]]; then
   printf '%s' '{"url":"https://download.test/file"}' >"${output}"
   printf '200'
@@ -116,6 +121,15 @@ path_output="$(PATH="${symlink_client}:${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="
 interpreter_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" TEST_CWD="${test_root}" bash -c 'cd "${TEST_CWD}" && bash launcher.sh --dry-run')"
 [[ "${interpreter_output}" == *"Ebonhold/common-required.dat"* ]]
 [[ "${interpreter_output}" == *"Ebonhold/new-required.dat"* ]]
+
+renamed_manifest_file="${test_root}/renamed-manifest.json"
+sed 's/roguelike-prod/renamed-game/g' "${manifest_file}" >"${renamed_manifest_file}"
+renamed_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${renamed_manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --game=renamed-game)"
+[[ "${renamed_output}" == *"Ebonhold/common-required.dat"* ]]
+
+bad_manifest_output="$(PATH="${mock_bin}:${PATH}" GUI=false MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" MOCK_GAMES_RESPONSE='{"error":"manifest service unavailable"}' MOCK_GAMES_HTTP_CODE=503 script -q -e -c "\"${test_root}/launcher.sh\" --dry-run" /dev/null 2>&1 || true)"
+[[ "${bad_manifest_output}" == *"manifest service unavailable"* ]]
+[[ "${bad_manifest_output}" != *"Game slug"* ]]
 
 status_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --status)"
 [[ "${status_output}" == *"Server test is online."* ]]
