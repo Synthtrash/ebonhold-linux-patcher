@@ -67,6 +67,40 @@ When run interactively without game arguments, the launcher checks installed add
 
 The launcher quickly checks game patch files, then launches the game. Omit `--quick` to check every required file. If files changed, it clears `.wdb` cache files and creates `Cache/invalid` before launch. If your cached token expires, a zenity login prompt will pop up.
 
+### Lutris
+
+Lutris can prepend a command to its normal Wine launch command:
+
+1. Open the game's **Configure** window.
+2. Open **System options**.
+3. Set **Command prefix** to the launcher command, using an absolute path:
+
+```bash
+/path/to/launcher.sh --quick --quiet
+```
+
+Leave the Lutris executable and working directory set to the game client. Lutris will run the launcher first; the launcher updates the client and then passes Lutris's normal Wine command through unchanged. Remove `--quiet` while testing if you want to see the update messages.
+
+### Bottles
+
+Bottles does not use Steam's `%command%` placeholder. The simplest setup is a small wrapper that runs the launcher and then Bottles' CLI:
+
+```bash
+#!/usr/bin/env bash
+exec /path/to/launcher.sh --quick --quiet \
+  flatpak run --command=bottles-cli com.usebottles.bottles run \
+  -b "MyBottle" -e "/path/to/Wow.exe"
+```
+
+Save it as `launch-ebonhold.sh`, replace `MyBottle` and the executable path, then run:
+
+```bash
+chmod +x launch-ebonhold.sh
+./launch-ebonhold.sh
+```
+
+For a non-Flatpak Bottles installation, replace the `flatpak run --command=bottles-cli com.usebottles.bottles` portion with `bottles-cli`. The launcher updates the client directory before invoking Bottles. Do not add the shell script as a Windows executable inside the bottle; it is a Linux launcher command.
+
 ---
 
 ## Credits
