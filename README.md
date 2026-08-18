@@ -62,7 +62,7 @@ When run interactively without game arguments, the launcher checks installed add
 2. Right-click the game → Properties → Launch Options:
 
 ```bash
-/path/to/launcher.sh --quick --quiet %command%
+/path/to/launcher.sh --quick --quiet -- %command%
 ```
 
 The launcher quickly checks game patch files, then launches the game. Omit `--quick` to check every required file. If files changed, it clears `.wdb` cache files and creates `Cache/invalid` before launch. If your cached token expires, a zenity login prompt will pop up.
@@ -76,7 +76,7 @@ Lutris can prepend a command to its normal Wine launch command:
 3. Set **Command prefix** to the launcher command, using an absolute path:
 
 ```bash
-/path/to/launcher.sh --quick --quiet
+/path/to/launcher.sh --quick --quiet --
 ```
 
 Leave the Lutris executable and working directory set to the game client. Lutris will run the launcher first; the launcher updates the client and then passes Lutris's normal Wine command through unchanged. Remove `--quiet` while testing if you want to see the update messages.
@@ -87,7 +87,7 @@ Bottles does not use Steam's `%command%` placeholder. The simplest setup is a sm
 
 ```bash
 #!/usr/bin/env bash
-exec /path/to/launcher.sh --quick --quiet \
+exec /path/to/launcher.sh --quick --quiet -- \
   flatpak run --command=bottles-cli com.usebottles.bottles run \
   -b "MyBottle" -e "/path/to/Wow.exe"
 ```
