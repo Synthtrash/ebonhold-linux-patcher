@@ -143,6 +143,10 @@ manage_token() {
 
   debug "No valid token found. Please log in."
 
+  if [[ "${GUI}" == "false" && "${interactiveShell}" == "false" ]]; then
+    error 1 "Cannot log in without a terminal or display. Run the launcher interactively once, or install zenity."
+  fi
+
   user="$(prompt_text "Ebonhold Login" "Enter your username:")" || error 1 "Cannot prompt for username: no terminal and no display available. Run interactively or install zenity."
   pass="$(prompt_password "Ebonhold Login" "Password for ${user}")" || error 1 "Cannot prompt for password: no terminal and no display available."
 
@@ -225,10 +229,6 @@ error() {
   fi
   [[ "${exit_code}" -ge "1" ]] && exit "${exit_code}"
 }
-
-if [[ "${GUI}" == "false" ]] && [[ "${interactiveShell}" == "false" ]]; then
-  error 1 "Cannot run in non-interactive mode without a display. Install zenity or run interactively first."
-fi
 
 prompt_text() {
   local title="${1}" text="${2}"
@@ -1271,7 +1271,7 @@ Usage: $0 [OPTIONS] [--] [game arguments]
 
 Options:
   --debug           Enable verbose output
-  --verify          Check files against manifest (no downloads)
+  --verify          Check files against manifest (no downloads or addon changes)
   --dry-run         Show what would be done without downloading
   --quick           Check only required game patch files
   --full            Update all common and game files, including optional files
@@ -1302,6 +1302,10 @@ fi
 
 if [[ "${quick}" == "true" && "${full}" == "true" ]]; then
   error 1 "--quick and --full cannot be used together."
+fi
+
+if [[ "${verify_only}" == "true" && ("${select_addons}" == "true" || -n "${addons}") ]]; then
+  error 1 "--verify cannot be combined with --select-addons or --addons."
 fi
 
 manage_token
@@ -1364,7 +1368,7 @@ fi
 
 if [[ ${#addon_ids[@]} -gt 0 ]]; then
   if [[ "${dry_run}" == "true" ]]; then
-    printf '%s[DRY RUN]%s Would download selected launcher addons: %s\n' "${YELLOW}" "${NC}" "${addons}"
+    [[ "${quiet}" == "false" ]] && printf '%s[DRY RUN]%s Would download selected launcher addons: %s\n' "${YELLOW}" "${NC}" "${addons}"
   elif [[ "${verify_only}" == "false" ]]; then
     download_addons
   fi

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep failure-path tests non-interactive even on desktops with zenity installed.
+export GUI=false
+
 repo_root="$(dirname "$(dirname "$(realpath "$0")")")"
 test_root="$(mktemp -d)"
 mock_bin="${test_root}/bin"
@@ -150,6 +153,12 @@ if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_
 fi
 
 PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --addons='Quest Helper' >/dev/null
+quiet_addon_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet --addons='Quest Helper')"
+[[ -z "${quiet_addon_output}" ]]
+if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --verify --addons='Quest Helper' >/dev/null 2>&1; then
+  printf 'Verify mode accepted addon changes.\n' >&2
+  exit 1
+fi
 
 if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" MOCK_ADDON_DOWNLOAD_RESPONSE='{"success":true,"files":[]}' "${test_root}/launcher.sh" --addons=Elvui >/dev/null 2>&1; then
   printf 'Partial addon download response was accepted.\n' >&2
