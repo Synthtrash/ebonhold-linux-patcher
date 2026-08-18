@@ -161,7 +161,8 @@ if PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_
 fi
 rm -f "${test_root}/Data/enUS/realmlist.wtf"
 
-PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet
+quiet_output="$(PATH="${mock_bin}:${PATH}" MOCK_MANIFEST_FILE="${manifest_file}" MOCK_ADDONS_FILE="${addons_file}" "${test_root}/launcher.sh" --dry-run --quiet)"
+[[ -z "${quiet_output}" ]]
 [[ ! -e "${test_root}/Data/enUS/realmlist.wtf" ]]
 [[ -f "${test_root}/Cache/WDB/enUS/cache.wdb" ]]
 

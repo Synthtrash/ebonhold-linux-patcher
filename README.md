@@ -18,7 +18,8 @@ Updates and launches the Project Ebonhold game client on Linux.
 
 ## Prerequisites
 
-- **curl**, **jq**, **md5sum**, **bc**, **unzip** (including `zipinfo`), **flock** (from `util-linux`) – usually pre-installed on most Linux.
+- **curl**, **jq**, **md5sum**, **bc**, **unzip** (including `zipinfo`), **flock** (from `util-linux`) – usually pre-installed on most Linux systems.
+- Standard GNU command-line tools such as `realpath`, `find`, `sed`, `grep`, `sort`, `date`, `stat`, and `mktemp`.
 - **zenity** (optional) – for GUI prompts; falls back to terminal prompts if missing.
 
 ---
@@ -50,17 +51,17 @@ chmod +x launcher.sh
 | `--remove-addons` | Interactively select installed launcher addons to remove |
 | `--remove-addons=LIST` | Remove comma-separated installed addon names or IDs |
 | `--addons=LIST` | Download comma-separated addon names or IDs, such as `--addons=Elvui,Details` |
-| `--quiet` | Suppress non-error output |
+| `--quiet` | Suppress routine output; warnings and errors remain |
 | `--help` | Show this message |
 
-When run interactively without game arguments, the launcher checks installed addons after updating and offers to install available updates. Steam and other passthrough launches never prompt. Use `--game=roguelike` for the PTR manifest.
+When run interactively without game arguments, the launcher checks installed addons after updating and offers to install available updates. Steam and other passthrough launches never prompt. Arguments after the launcher options are passed to the game; use `--` when you want to clearly separate them from launcher options. Use `--game=roguelike` for the PTR manifest.
 
 ### Steam (non-Steam game)
 
 1. Add `Wow.exe` as a non-Steam game in Steam.
 2. Right-click the game → Properties → Launch Options:
 
-```
+```bash
 /path/to/launcher.sh --quick --quiet %command%
 ```
 

@@ -386,6 +386,7 @@ check_server_status() {
   fi
   local online="$(jq -r '.data.online' <<<"${response}")"
   local realm_name="$(jq -r '.data.serverName // "unknown"' <<<"${response}")"
+  [[ "${quiet}" == "true" && "${online}" == "true" ]] && return 0
   if [[ "${online}" == "true" ]]; then
     printf '%s[INFO]%s Server %s is online.\n' "${GREEN}" "${NC}" "${realm_name}"
   else
@@ -402,14 +403,14 @@ update_realmlist() {
   if [[ -f "${dest}" ]]; then
     local current="$(<"${dest}")"
     if [[ "${current}" != "set realmlist ${realmlist}" ]]; then
-      printf '%s[REALMLIST]%s Updating %s to %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
+      [[ "${quiet}" == "false" ]] && printf '%s[REALMLIST]%s Updating %s to %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
       printf 'set realmlist %s\n' "${realmlist}" >"${dest}"
       realmlist_updated=true
     else
       debug "realmlist.wtf already correct."
     fi
   else
-    printf '%s[REALMLIST]%s Creating %s with %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
+    [[ "${quiet}" == "false" ]] && printf '%s[REALMLIST]%s Creating %s with %s\n' "${YELLOW}" "${NC}" "${dest}" "${realmlist}"
     printf 'set realmlist %s\n' "${realmlist}" >"${dest}"
     realmlist_updated=true
   fi
@@ -1037,7 +1038,11 @@ update_files() {
   index_manifest_paths "$files_json"
 
   if [[ "${verify_only}" == "true" ]]; then
-    verify_files "$files_json"
+    if [[ "${quiet}" == "true" ]]; then
+      verify_files "$files_json" >/dev/null
+    else
+      verify_files "$files_json"
+    fi
     return $?
   fi
 
@@ -1065,17 +1070,19 @@ update_files() {
 
     download_needed=false
     if [[ ! -f "${dest}" ]]; then
-      printf '%s[MISSING]%s %s is missing.\n' "${YELLOW}" "${NC}" "${path}"
+      [[ "${quiet}" == "false" ]] && printf '%s[MISSING]%s %s is missing.\n' "${YELLOW}" "${NC}" "${path}"
       download_needed=true
     else
       local_md5="$(md5sum "${dest}" | cut -d' ' -f1)"
       if [[ "${local_md5}" != "${expected_md5}" ]]; then
-        printf '%s[MISMATCH]%s %s MD5 verification failed.\n' "${RED}" "${NC}" "${path}"
-        printf '  Expected: %s\n' "${expected_md5}"
-        printf '  Local:    %s\n' "${local_md5}"
+        if [[ "${quiet}" == "false" ]]; then
+          printf '%s[MISMATCH]%s %s MD5 verification failed.\n' "${RED}" "${NC}" "${path}"
+          printf '  Expected: %s\n' "${expected_md5}"
+          printf '  Local:    %s\n' "${local_md5}"
+        fi
         download_needed=true
       else
-        printf '%s[OK]%s %s matches MD5 signature: %s%s%s\n' "${GREEN}" "${NC}" "${path}" "${GREEN}" "${expected_md5}" "${NC}"
+        [[ "${quiet}" == "false" ]] && printf '%s[OK]%s %s matches MD5 signature: %s%s%s\n' "${GREEN}" "${NC}" "${path}" "${GREEN}" "${expected_md5}" "${NC}"
         if ! is_read_only_mode && remove_case_variants "${dest}"; then
           files_updated=true
         fi
@@ -1095,16 +1102,18 @@ update_files() {
   fi
 
   if [[ "${dry_run}" == "true" ]]; then
-    printf '%s[DRY RUN]%s The following files would be downloaded:\n' "${YELLOW}" "${NC}"
-    for task in "${download_tasks[@]}"; do
-      id="${task%%|*}"
-      rest="${task#*|}"
-      dest="${rest%%|*}"
-      rest="${rest#*|}"
-      path="${rest%%|*}"
-      printf '  - %s (ID: %s)\n' "${path}" "${id}"
-    done
-    printf 'Total: %s files\n' "${#download_tasks[@]}"
+    if [[ "${quiet}" == "false" ]]; then
+      printf '%s[DRY RUN]%s The following files would be downloaded:\n' "${YELLOW}" "${NC}"
+      for task in "${download_tasks[@]}"; do
+        id="${task%%|*}"
+        rest="${task#*|}"
+        dest="${rest%%|*}"
+        rest="${rest#*|}"
+        path="${rest%%|*}"
+        printf '  - %s (ID: %s)\n' "${path}" "${id}"
+      done
+      printf 'Total: %s files\n' "${#download_tasks[@]}"
+    fi
     return 0
   fi
 
@@ -1249,6 +1258,7 @@ for arg in "${@}"; do
     remove_addons_only=true
     ;;
   --remove-addons=*)
+    remove_addons_only=true
     remove_addons="${arg#--remove-addons=}"
     ;;
   --dry-run)
@@ -1267,14 +1277,14 @@ Options:
   --full            Update all common and game files, including optional files
   --status          Show realm status and exit
   --game=SLUG       Select a game from the launcher manifest
-  --list-addons     Show addons available for the selected game and exit
+  --list-addons     Show addons in the official launcher catalog and exit
   --check-addons    Show installed addon update recommendations and exit
   --select-addons   Interactively select addons to download
   --remove-addons   Interactively select installed addons to remove
   --remove-addons=LIST
                     Remove comma-separated installed addon names or IDs
   --addons=LIST     Download comma-separated addon names or IDs
-  --quiet           Suppress non-error output
+  --quiet           Suppress routine output; warnings and errors remain
   --help            Show this help message
 
 Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet %command%
