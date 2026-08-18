@@ -20,7 +20,7 @@ Updates and launches the Project Ebonhold game client on Linux.
 
 - **curl**, **jq**, **md5sum**, **bc**, **unzip** (including `zipinfo`), **flock** (from `util-linux`) – usually pre-installed on most Linux systems.
 - Standard GNU command-line tools such as `realpath`, `find`, `sed`, `grep`, `sort`, `date`, `stat`, and `mktemp`.
-- **zenity** (optional) – for GUI prompts; falls back to terminal prompts if missing.
+- **zenity** (optional) – for GUI prompts; falls back to terminal prompts if missing. Once a token is cached, non-interactive launches can run without either one; the first login still needs a terminal or display.
 
 ---
 
@@ -39,7 +39,7 @@ chmod +x launcher.sh
 | Flag | Description |
 | ------ | ------------- |
 | `--debug` | Enable verbose output |
-| `--verify` | Check files against manifest without changing client files, cache, realmlist, or token |
+| `--verify` | Check files against the manifest without changing client files, cache, realmlist, token, or addons |
 | `--dry-run` | Show downloads that would be needed without changing client files, cache, realmlist, or token |
 | `--quick` | Check only required game patch files, matching the previous default behavior |
 | `--full` | Check and update all common and game files, including optional files |
