@@ -26,13 +26,26 @@ set -euo pipefail
 
 output=""
 url=""
+config=""
 for ((i = 1; i <= $#; i++)); do
   if [[ "${!i}" == "-o" ]]; then
     next=$((i + 1))
     output="${!next}"
   fi
+  if [[ "${!i}" == "--config" ]]; then
+    next=$((i + 1))
+    config="${!next}"
+  fi
   [[ "${!i}" == http* ]] && url="${!i}"
 done
+if [[ -n "${config}" && -f "${config}" ]]; then
+  while IFS= read -r config_line; do
+    if [[ "${config_line}" == 'url = "'* ]]; then
+      url="${config_line#url = \"}"
+      url="${url%\"}"
+    fi
+  done <"${config}"
+fi
 if [[ "${url}" == *"/games" ]]; then
   if [[ -n "${MOCK_GAMES_RESPONSE:-}" ]]; then
     printf '%s' "${MOCK_GAMES_RESPONSE}"
