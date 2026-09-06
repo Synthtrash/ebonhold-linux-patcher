@@ -22,6 +22,9 @@ addon_update_names=()
 declare -A manifest_dest_paths=()
 remove_addons=""
 remove_addons_only=false
+relogin=false
+forget_login=false
+renew_auth=false
 
 script_path="${0}"
 if [[ "${script_path}" != */* ]]; then
@@ -46,9 +49,288 @@ addons_api="https://api.project-ebonhold.com/api/launcher/addons"
 addon_download_base="https://api.project-ebonhold.com/api/launcher/addons/download?addon_ids="
 token_file="${targetdir}/.updaterToken"
 addon_state_file="${targetdir}/Interface/AddOns/.ebonhold-launcher-addons.json"
+account_hint_key="username"
+keyring_service="com.project-ebonhold.updater"
+installation_identity="$(realpath -e "${targetdir}" 2>/dev/null || realpath -m "${targetdir}")"
+installation_key="$(printf '%s' "${installation_identity}" | sha256sum | cut -d' ' -f1)"
+keyring_tool="$(command -v secret-tool 2>/dev/null || true)"
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  auth_lock_dir="${XDG_RUNTIME_DIR}/ebonhold-updater"
+else
+  auth_lock_dir="${TMPDIR:-/tmp}/ebonhold-updater-${EUID}"
+fi
+auth_lock_file="${auth_lock_dir}/auth-${installation_key}.lock"
+auth_lock_fd=""
 
 is_read_only_mode() {
   [[ "${verify_only}" == "true" || "${dry_run}" == "true" ]]
+}
+
+credential_path_is_safe() {
+  local destination="$1"
+  local directory
+
+  [[ -n "${destination}" && ! -L "${destination}" ]] || return 1
+  [[ ! -e "${destination}" || -f "${destination}" ]] || return 1
+  directory="$(dirname "${destination}")"
+  [[ -d "${directory}" && ! -L "${directory}" ]]
+}
+
+write_private_credential() {
+  local destination="$1"
+  local value="$2"
+  local directory basename temporary previous_umask result
+
+  credential_path_is_safe "${destination}" || return 1
+  directory="$(dirname "${destination}")"
+  basename="$(basename "${destination}")"
+  previous_umask="$(umask)"
+  umask 077
+  temporary="$(mktemp "${directory}/.${basename}.XXXXXX")" || {
+    umask "${previous_umask}"
+    return 1
+  }
+  if ! chmod 600 "${temporary}" || ! printf '%s' "${value}" >"${temporary}"; then
+    rm -f -- "${temporary}"
+    umask "${previous_umask}"
+    return 1
+  fi
+  if [[ -L "${destination}" ]] || ! mv -f -- "${temporary}" "${destination}"; then
+    rm -f -- "${temporary}"
+    umask "${previous_umask}"
+    return 1
+  fi
+  [[ "$(stat -c '%a' "${destination}" 2>/dev/null)" == "600" ]]
+  result=$?
+  umask "${previous_umask}"
+  return "${result}"
+}
+
+curl_config_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  printf '%s' "${value}"
+}
+
+curl_authenticated() {
+  local token="$1"
+  shift
+  local config escaped status previous_umask
+
+  [[ -n "${token}" && ! "${token}" =~ [[:cntrl:]] ]] || return 1
+  previous_umask="$(umask)"
+  umask 077
+  config="$(mktemp)" || {
+    umask "${previous_umask}"
+    return 1
+  }
+  if ! chmod 600 "${config}" ||
+    ! escaped="$(curl_config_escape "${token}")" ||
+    ! printf 'header = "Authorization: Bearer %s"\n' "${escaped}" >"${config}"; then
+    rm -f -- "${config}"
+    umask "${previous_umask}"
+    return 1
+  fi
+  curl --config "${config}" "$@"
+  status=$?
+  rm -f -- "${config}"
+  umask "${previous_umask}"
+  return "${status}"
+}
+
+curl_url() {
+  local url="$1"
+  shift
+  local config escaped status previous_umask
+
+  [[ "${url}" == https://* && ! "${url}" =~ [[:cntrl:]] ]] || return 1
+  previous_umask="$(umask)"
+  umask 077
+  config="$(mktemp)" || {
+    umask "${previous_umask}"
+    return 1
+  }
+  if ! chmod 600 "${config}" ||
+    ! escaped="$(curl_config_escape "${url}")" ||
+    ! printf 'url = "%s"\n' "${escaped}" >"${config}"; then
+    rm -f -- "${config}"
+    umask "${previous_umask}"
+    return 1
+  fi
+  curl --config "${config}" "$@"
+  status=$?
+  rm -f -- "${config}"
+  umask "${previous_umask}"
+  return "${status}"
+}
+
+private_runtime_directory() {
+  local directory="$1"
+  local mode
+
+  [[ -d "${directory}" && ! -L "${directory}" && -O "${directory}" ]] || return 1
+  mode="$(stat -c '%a' "${directory}" 2>/dev/null)" || return 1
+  [[ "${mode}" == *00 ]]
+}
+
+lock_parent_is_safe() {
+  local directory="$1"
+  local mode owner
+
+  [[ -d "${directory}" && ! -L "${directory}" ]] || return 1
+  mode="$(stat -c '%a' "${directory}" 2>/dev/null)" || return 1
+  owner="$(stat -c '%u' "${directory}" 2>/dev/null)" || return 1
+  if (((8#${mode} & 0022) != 0)); then
+    (((8#${mode} & 01000) != 0 && owner == 0)) || return 1
+  fi
+}
+
+prepare_auth_lock_dir() {
+  local parent
+
+  if [[ -L "${auth_lock_dir}" ]]; then
+    return 1
+  fi
+  parent="$(dirname "${auth_lock_dir}")"
+  lock_parent_is_safe "${parent}" || return 1
+  if [[ ! -e "${auth_lock_dir}" ]]; then
+    (
+      umask 077
+      mkdir -- "${auth_lock_dir}"
+    ) 2>/dev/null || {
+      [[ -d "${auth_lock_dir}" ]] || return 1
+    }
+  fi
+  private_runtime_directory "${auth_lock_dir}"
+}
+
+auth_lock_file_is_safe() {
+  [[ ! -L "${auth_lock_file}" ]] || return 1
+  if [[ -e "${auth_lock_file}" ]]; then
+    [[ -f "${auth_lock_file}" && -O "${auth_lock_file}" ]] || return 1
+  fi
+}
+
+acquire_auth_lock() {
+  local previous_umask
+
+  command -v flock >/dev/null 2>&1 || return 1
+  prepare_auth_lock_dir || return 1
+  auth_lock_file_is_safe || return 1
+  previous_umask="$(umask)"
+  umask 077
+  if ! exec {auth_lock_fd}>>"${auth_lock_file}"; then
+    umask "${previous_umask}"
+    return 1
+  fi
+  umask "${previous_umask}"
+  if ! auth_lock_file_is_safe || ! flock -x "${auth_lock_fd}"; then
+    exec {auth_lock_fd}>&-
+    auth_lock_fd=""
+    return 1
+  fi
+}
+
+release_auth_lock() {
+  [[ -n "${auth_lock_fd}" ]] || return 0
+  flock -u "${auth_lock_fd}" 2>/dev/null || true
+  exec {auth_lock_fd}>&-
+  auth_lock_fd=""
+}
+
+account_key_for_user() {
+  local username="$1"
+  [[ -n "${username}" ]] || return 1
+  printf '%s' "${username}" | sha256sum | cut -d' ' -f1
+}
+
+keyring_lookup_secret() {
+  local kind="$1"
+  local account="${2:-}"
+  [[ -n "${keyring_tool}" ]] || return 3
+  if [[ -n "${account}" ]]; then
+    "${keyring_tool}" lookup service "${keyring_service}" installation "${installation_identity}" \
+      kind "${kind}" account "${account}" 2>/dev/null
+  else
+    "${keyring_tool}" lookup service "${keyring_service}" installation "${installation_identity}" \
+      kind "${kind}" 2>/dev/null
+  fi
+}
+
+keyring_store_secret() {
+  local kind="$1"
+  local secret="$2"
+  local account="${3:-}"
+  is_read_only_mode && return 1
+  [[ -n "${keyring_tool}" ]] || return 1
+  if [[ -n "${account}" ]]; then
+    printf '%s' "${secret}" |
+      "${keyring_tool}" store --label="Ebonhold Updater login" \
+        service "${keyring_service}" installation "${installation_identity}" kind "${kind}" account "${account}" \
+        >/dev/null 2>&1
+  else
+    printf '%s' "${secret}" |
+      "${keyring_tool}" store --label="Ebonhold Updater account" \
+        service "${keyring_service}" installation "${installation_identity}" kind "${kind}" \
+        >/dev/null 2>&1
+  fi
+}
+
+keyring_clear_secret() {
+  local kind="$1"
+  local account="${2:-}"
+  [[ -n "${keyring_tool}" ]] || return 1
+  if [[ -n "${account}" ]]; then
+    "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" \
+      kind "${kind}" account "${account}" >/dev/null 2>&1
+  else
+    "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" \
+      kind "${kind}" >/dev/null 2>&1
+  fi
+}
+
+keyring_clear_installation() {
+  [[ -n "${keyring_tool}" ]] || return 1
+  "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" >/dev/null 2>&1
+}
+
+load_saved_credentials() {
+  local saved_account=""
+
+  saved_username=""
+  saved_password=""
+  [[ -n "${keyring_tool}" ]] || return 3
+  if ! saved_username="$(keyring_lookup_secret "${account_hint_key}")" || [[ -z "${saved_username}" ]]; then
+    saved_username=""
+    return 1
+  fi
+  saved_account="$(account_key_for_user "${saved_username}")" || {
+    saved_username=""
+    return 1
+  }
+  if ! saved_password="$(keyring_lookup_secret password "${saved_account}")" || [[ -z "${saved_password}" ]]; then
+    saved_username=""
+    saved_password=""
+    return 1
+  fi
+  return 0
+}
+
+save_credentials_to_keyring() {
+  local username="$1"
+  local password="$2"
+  local account
+
+  account="$(account_key_for_user "${username}")" || return 1
+  keyring_store_secret "${account_hint_key}" "${username}" || return 1
+  if ! keyring_store_secret password "${password}" "${account}"; then
+    keyring_clear_secret "${account_hint_key}" || true
+    return 1
+  fi
+  return 0
 }
 
 safe_destination() {
@@ -81,8 +363,7 @@ fetch_games_manifest() {
 
   games_http_code=""
   games_error=""
-  if ! response="$(curl -sS --connect-timeout 10 --max-time 60 -w $'\n%{http_code}' \
-    -H "Authorization: Bearer ${token}" \
+  if ! response="$(curl_authenticated "${token}" -sS --connect-timeout 10 --max-time 60 -w $'\n%{http_code}' \
     -H "User-Agent: EbonholdLauncher/1.0" \
     -H "Accept: application/json" \
     -H "X-Client-Id: EbonholdLauncher" \
@@ -99,6 +380,7 @@ fetch_games_manifest() {
     ! jq -e '.success == true and (.data.games | type == "array")' <<<"${response}" >/dev/null 2>&1; then
     games_error="$(jq -r '.error // .message // empty' <<<"${response}" 2>/dev/null)"
     [[ -n "${games_error}" ]] || games_error="HTTP ${games_http_code:-unknown}"
+    games_error="${games_error//"${token}"/[redacted]}"
     [[ "${games_http_code}" == "401" || "${games_http_code}" == "403" ]] && return 2
     return 1
   fi
@@ -107,22 +389,122 @@ fetch_games_manifest() {
   return 0
 }
 
+authenticate_with_credentials() {
+  local username="$1"
+  local password="$2"
+  local session=""
+  local curl_status=0
+
+  login_token=""
+  login_http_code=""
+  login_error=""
+  curl_status=0
+  session="$(printf '%s' "${password}" |
+    jq -n --arg username "${username}" --rawfile password /dev/stdin \
+      '{username: $username, password: $password, rememberMe: true}' |
+    curl -sS --connect-timeout 10 --max-time 60 -X POST -w $'\n%{http_code}' \
+      -H "Content-Type: application/json" \
+      -H "User-Agent: EbonholdLauncher/1.0" \
+      -d @- \
+      "${login_api}")" || curl_status=$?
+
+  login_http_code="${session##*$'\n'}"
+  session="${session%$'\n'*}"
+  if [[ ${curl_status} -ne 0 ]]; then
+    login_error="Authentication request failed."
+    return 1
+  fi
+
+  if [[ "${login_http_code}" == "401" || "${login_http_code}" == "403" ]]; then
+    login_error="Ebonhold rejected the supplied credentials."
+    return 2
+  fi
+  if [[ ! "${login_http_code}" =~ ^2[0-9][0-9]$ ]]; then
+    login_error="Authentication service returned HTTP ${login_http_code:-unknown}."
+    return 1
+  fi
+  if ! jq -e '.success == true' <<<"${session}" >/dev/null 2>&1; then
+    login_error="Authentication service rejected the login request (HTTP ${login_http_code:-unknown})."
+    return 1
+  fi
+
+  login_token="$(jq -r '.token // empty' <<<"${session}")"
+  if [[ -z "${login_token}" || "${login_token}" == "null" || "${login_token}" =~ [[:space:]] ]]; then
+    login_token=""
+    login_error="Login succeeded but no valid token was returned."
+    return 1
+  fi
+  return 0
+}
+
+prompt_remember_login() {
+  local answer=""
+  local warning_text="Remember me on this computer? Your password will be stored in your desktop keyring. Only enable this on a computer you trust."
+
+  remember_login=false
+  if [[ "${GUI}" == "true" ]]; then
+    answer="$(zenity --list --checklist --title="Ebonhold Login" --text="${warning_text}" \
+      --column="Remember" --column="Choice" --separator="|" FALSE "Remember me on this computer" 2>/dev/null)" || answer=""
+    [[ -n "${answer}" ]] && remember_login=true
+    return 0
+  fi
+
+  printf '%s\n' "${warning_text}" >&2
+  read -r -p 'Remember me on this computer? [y/N] ' answer || answer=""
+  case "${answer}" in
+  [Yy] | [Yy][Ee][Ss]) remember_login=true ;;
+  esac
+}
+
+persist_authenticated_token() {
+  local token="$1"
+
+  is_read_only_mode && return 0
+  write_private_credential "${token_file}" "${token}" || return 1
+  debug "Secure auth token serialized locally (permissions: 600)."
+}
+
+save_manual_login_if_requested() {
+  local username="$1"
+  local password="$2"
+
+  is_read_only_mode && return 0
+  [[ "${remember_login:-false}" == "true" ]] || return 0
+  if [[ -z "${keyring_tool}" ]]; then
+    warn "Remember me was not saved: the optional secret-tool desktop-keyring helper is unavailable. The launcher will continue without storing your password."
+    return 0
+  fi
+  if ! save_credentials_to_keyring "${username}" "${password}"; then
+    warn "Remember me was not saved because the desktop keyring is unavailable or locked. The launcher will continue without storing your password."
+    return 0
+  fi
+  debug "Remembered login stored in the desktop keyring for this installation."
+}
+
 manage_token() {
   local token=""
   local user=""
   local pass=""
   local manifest_result=0
+  local login_result=0
+  local had_cached_token=false
+  local force_renew="${renew_auth}"
+  local remember_login=false
 
+  if [[ -L "${token_file}" ]]; then
+    error 1 "Refusing symlinked authentication token destination: ${token_file}"
+  fi
   if [[ -f "${token_file}" ]]; then
-    token="$(<"${token_file}")"
+    if ! token="$(<"${token_file}")"; then
+      error 1 "Could not read the cached authentication token."
+    fi
     if [[ -z "${token}" || "${token}" == "null" ]]; then
-      debug "Token file exists but is empty or contains 'null'. Clearing it."
-      is_read_only_mode || rm -f "${token_file}"
       token=""
     fi
   fi
+  [[ -n "${token}" ]] && had_cached_token=true
 
-  if [[ -n "${token}" ]]; then
+  if [[ "${relogin}" != "true" && "${force_renew}" != "true" && -n "${token}" ]]; then
     debug "Auth token found, verifying token."
     if fetch_games_manifest "${token}"; then
       debug "Token verified successfully."
@@ -131,66 +513,118 @@ manage_token() {
     else
       manifest_result=$?
       if [[ ${manifest_result} -eq 2 ]]; then
-        debug "Token invalid or expired. Clearing session."
-        is_read_only_mode || rm -f "${token_file}"
+        debug "Token invalid or expired; cached token will be retained until replacement succeeds."
         token=""
       else
         error 1 "Failed to fetch games manifest (HTTP ${games_http_code:-unknown}).\n${games_error}"
       fi
     fi
+  elif [[ "${relogin}" == "true" ]]; then
+    debug "Manual re-login requested; cached credentials will not be used."
+  elif [[ "${force_renew}" == "true" ]]; then
+    debug "Forced authentication renewal requested; the cached token will not be reused."
+  fi
+
+  if [[ "${relogin}" != "true" && -n "${keyring_tool}" ]]; then
+    if load_saved_credentials; then
+      debug "Trying the opted-in desktop-keyring login once."
+      if authenticate_with_credentials "${saved_username}" "${saved_password}"; then
+        login_result=0
+      else
+        login_result=$?
+      fi
+      if [[ ${login_result} -eq 0 ]]; then
+        if ! fetch_games_manifest "${login_token}"; then
+          error 1 "Failed to fetch games manifest after saved login (HTTP ${games_http_code:-unknown}).\n${games_error}"
+        fi
+        persist_authenticated_token "${login_token}" || error 1 "Authenticated successfully, but could not securely write ${token_file}."
+        authToken="${login_token}"
+        unset saved_username saved_password
+        debug "Saved desktop-keyring login succeeded."
+        return 0
+      elif [[ ${login_result} -eq 1 ]]; then
+        error 1 "Saved desktop-keyring login could not reach the authentication service.\n${login_error}"
+      else
+        warn "The saved desktop-keyring login was rejected. Please sign in manually; it will not be retried automatically."
+      fi
+      unset saved_username saved_password
+    elif [[ ${had_cached_token} == true ]]; then
+      warn "The saved desktop-keyring login is unavailable or locked. Continuing with one manual login attempt."
+    fi
+  elif [[ ${had_cached_token} == true && -z "${keyring_tool}" ]]; then
+    warn "The optional secret-tool desktop-keyring helper is unavailable. Continuing with one manual login attempt."
   fi
 
   debug "No valid token found. Please log in."
-
   if [[ "${GUI}" == "false" && "${interactiveShell}" == "false" ]]; then
-    error 1 "Cannot log in without a terminal or display. Run the launcher interactively once, or provide a graphical display."
+    error 1 "Cannot authenticate without a terminal or display. Run the launcher interactively once, or provide a graphical display."
   fi
 
   user="$(prompt_text "Ebonhold Login" "Enter your username:")" || error 1 "Cannot prompt for username: no terminal and no display available. Run interactively or install zenity."
   pass="$(prompt_password "Ebonhold Login" "Password for ${user}")" || error 1 "Cannot prompt for password: no terminal and no display available."
 
   debug "Posting credentials to authentication portal..."
-  session="$(jq -n --arg username "${user}" --arg password "${pass}" \
-    '{username: $username, password: $password, rememberMe: true}' |
-    curl -s --connect-timeout 10 --max-time 60 -X POST -w "\n%{http_code}" \
-      -H "Content-Type: application/json" \
-      -H "User-Agent: EbonholdLauncher/1.0" \
-      -d @- \
-      "${login_api}")"
-
-  http_code="$(sed -n '$p' <<<"${session}")"
-  session="$(sed '$d' <<<"${session}")"
-
-  debug "HTTP return code ${http_code}"
-  if [[ "${debug}" == "true" ]]; then
-    debug "Login response body:"
-    printf '%s\n' "${session}" | jq . 2>/dev/null || printf '%s\n' "${session}" >&2
+  if authenticate_with_credentials "${user}" "${pass}"; then
+    login_result=0
+  else
+    login_result=$?
   fi
-
-  if [[ ! "${http_code}" =~ ^2[0-9][0-9]$ ]] || ! jq -e '.success == true' <<<"${session}" >/dev/null 2>&1; then
-    message="$(jq -r '.message // empty' <<<"${session}")"
-    [[ -z "${message}" ]] && message="HTTP Gateway Reject Code: ${http_code}"
-    error 1 "Session authorization failed.\n${message}"
+  if [[ ${login_result} -eq 2 ]]; then
+    error 1 "Session authorization failed.\n${login_error}"
+  elif [[ ${login_result} -ne 0 ]]; then
+    error 1 "Session authorization failed.\n${login_error}"
   fi
+  debug "HTTP return code ${login_http_code}"
 
-  token="$(jq -r '.token' <<<"${session}")"
-  if [[ -z "${token}" || "${token}" == "null" ]]; then
-    error 1 "Login succeeded but no valid token was returned."
-  fi
-
-  if ! is_read_only_mode; then
-    printf '%s' "${token}" >"${token_file}"
-    chmod 600 "${token_file}"
-    debug "Secure auth token serialized locally (permissions: 600)."
-  fi
-
-  if ! fetch_games_manifest "${token}"; then
+  if ! fetch_games_manifest "${login_token}"; then
     error 1 "Failed to fetch games manifest (HTTP ${games_http_code:-unknown}).\n${games_error}"
   fi
 
+  if ! is_read_only_mode; then
+    prompt_remember_login
+  fi
+  persist_authenticated_token "${login_token}" || error 1 "Authenticated successfully, but could not securely write ${token_file}."
+  if ! is_read_only_mode && [[ "${remember_login}" == "false" && -n "${keyring_tool}" ]]; then
+    if ! keyring_clear_installation; then
+      warn "The previous desktop-keyring login could not be cleared. Use --forget-login and try again."
+    fi
+  fi
+  save_manual_login_if_requested "${user}" "${pass}"
+
   unset user pass
-  authToken="${token}"
+  authToken="${login_token}"
   debug "Authentication successful."
+}
+
+forget_login_state() {
+  local failed=false
+
+  if ! acquire_auth_lock; then
+    warn "Could not lock the updater credentials for clearing."
+    return 1
+  fi
+
+  if [[ -e "${token_file}" || -L "${token_file}" ]]; then
+    if ! rm -f -- "${token_file}"; then
+      warn "Could not remove the cached updater token: ${token_file}"
+      failed=true
+    fi
+  fi
+
+  if [[ -z "${keyring_tool}" ]]; then
+    warn "Could not clear desktop-keyring credentials: secret-tool is unavailable."
+    failed=true
+  elif ! keyring_clear_installation; then
+    warn "Could not clear desktop-keyring credentials for this installation. The keyring may be locked; retry --forget-login after unlocking it."
+    failed=true
+  fi
+  release_auth_lock
+
+  if [[ "${failed}" == "true" ]]; then
+    return 1
+  fi
+  [[ "${quiet}" == "true" ]] || printf 'Forgot the cached updater token and desktop-keyring login for this installation.\n'
+  return 0
 }
 
 if [[ -t 0 ]]; then interactiveShell="true"; else interactiveShell="false"; fi
@@ -227,6 +661,14 @@ error() {
     printf '\n\033[2K%s[ERROR]:%s %s%b%s\n' "${RED}" "${NC}" "${YELLOW}" "${msg}" "${NC}" >&2
   fi
   [[ "${exit_code}" -ge "1" ]] && exit "${exit_code}"
+}
+
+warn() {
+  local msg="${*}"
+  if [[ "${GUI}" == "true" ]]; then
+    zenity --warning --title="Ebonhold Login" --text="${msg}" --width=460 2>/dev/null || true
+  fi
+  printf '%s[WARN]%s %s\n' "${YELLOW}" "${NC}" "${msg}" >&2
 }
 
 prompt_text() {
@@ -289,96 +731,90 @@ download_file_by_id() {
   local dest_path="$2"
   local description="${3:-$dest_path}"
   local expected_md5="$4"
-  local retry=0
-  local max_retries=1
   local tmp_out=""
   local tmp_file=""
   local downloaded_md5=""
+  local status=""
+  local curl_status=0
+  local response=""
+  local url=""
+  local size=""
 
   debug "Downloading file ID ${file_id} -> ${dest_path}"
 
-  while [[ $retry -le $max_retries ]]; do
-    tmp_out="$(mktemp)" || return 1
-    status="$(curl -s --connect-timeout 10 --max-time 60 -w "%{http_code}" -o "${tmp_out}" \
-      -H "Authorization: Bearer ${authToken}" \
-      -H "User-Agent: EbonholdLauncher/1.0" \
-      -H "Accept: application/json" \
-      -H "X-Client-Id: EbonholdLauncher" \
-      -H "Origin: https://project-ebonhold.com" \
-      -H "Referer: https://project-ebonhold.com/download" \
-      "${patch_download_base}${file_id}" 2>/dev/null)"
-    response="$(<"${tmp_out}")"
-    rm -f "${tmp_out}"
+  tmp_out="$(mktemp)" || return 1
+  status="$(curl_authenticated "${authToken}" -sS --connect-timeout 10 --max-time 60 -w "%{http_code}" -o "${tmp_out}" \
+    -H "User-Agent: EbonholdLauncher/1.0" \
+    -H "Accept: application/json" \
+    -H "X-Client-Id: EbonholdLauncher" \
+    -H "Origin: https://project-ebonhold.com" \
+    -H "Referer: https://project-ebonhold.com/download" \
+    "${patch_download_base}${file_id}" 2>/dev/null)"
+  curl_status=$?
+  response="$(<"${tmp_out}")"
+  rm -f -- "${tmp_out}"
 
-    if [[ "${status}" != "200" ]]; then
-      if [[ "${status}" == "401" && $retry -lt $max_retries ]]; then
-        debug "Token rejected (401). Re‑authenticating..."
-        rm -f "${token_file}"
-        manage_token
-        ((retry++))
-        debug "Retry ${retry}/${max_retries} with new token."
-        continue
-      fi
-      printf '%s[ERROR]%s Failed to get download URL for ID %s (HTTP %s)\n' "${RED}" "${NC}" "${file_id}" "${status}"
-      printf 'Server response:\n'
-      printf '%s\n' "${response}" | jq . 2>/dev/null || printf '%s\n' "${response}"
-      return 1
-    fi
+  [[ ${curl_status} -eq 0 ]] || status="${status:-000}"
+  if [[ "${status}" == "401" ]]; then
+    return 2
+  fi
+  if [[ "${status}" != "200" ]]; then
+    printf '%s[ERROR]%s Failed to get download URL for ID %s (HTTP %s)\n' "${RED}" "${NC}" "${file_id}" "${status:-unknown}"
+    return 1
+  fi
 
-    url="$(jq --raw-output '.files[0].url' <<<"${response}" 2>/dev/null)"
-    if [[ -z "${url}" || "${url}" == "null" ]]; then
-      url="$(jq --raw-output '.url' <<<"${response}" 2>/dev/null)"
-    fi
-    if [[ -z "${url}" || "${url}" == "null" ]]; then
-      printf '%s[ERROR]%s No download URL found for ID %s\n' "${RED}" "${NC}" "${file_id}"
-      return 1
-    fi
+  url="$(jq --raw-output '.files[0].url' <<<"${response}" 2>/dev/null)"
+  if [[ -z "${url}" || "${url}" == "null" ]]; then
+    url="$(jq --raw-output '.url' <<<"${response}" 2>/dev/null)"
+  fi
+  if [[ -z "${url}" || "${url}" == "null" ]]; then
+    printf '%s[ERROR]%s No download URL found for ID %s\n' "${RED}" "${NC}" "${file_id}"
+    return 1
+  fi
 
-    if [[ "${url}" != https://* ]]; then
-      printf '%s[ERROR]%s Refusing non-HTTPS download URL for %s\n' "${RED}" "${NC}" "${description}"
-      return 1
-    fi
+  if [[ "${url}" != https://* ]]; then
+    printf '%s[ERROR]%s Refusing non-HTTPS download URL for %s\n' "${RED}" "${NC}" "${description}"
+    return 1
+  fi
 
-    debug "Download URL: ${url}"
-    mkdir -p "$(dirname "${dest_path}")" || return 1
-    tmp_file="$(mktemp "${dest_path}.tmp.XXXXXX")" || return 1
+  mkdir -p "$(dirname "${dest_path}")" || return 1
+  tmp_file="$(mktemp "${dest_path}.tmp.XXXXXX")" || return 1
 
-    if [[ "${quiet}" == "false" ]]; then
-      printf '%s[DOWNLOADING]%s %s...\n' "${BLUE}" "${NC}" "${description}"
-    fi
-    if ! curl --fail --location --show-error --connect-timeout 10 --max-time 600 --retry 2 --retry-all-errors "${url}" -o "${tmp_file}"; then
-      rm -f "${tmp_file}"
-      printf '%s[ERROR]%s Failed to download %s\n' "${RED}" "${NC}" "${description}"
-      return 1
-    fi
+  if [[ "${quiet}" == "false" ]]; then
+    printf '%s[DOWNLOADING]%s %s...\n' "${BLUE}" "${NC}" "${description}"
+  fi
+  if ! curl_url "${url}" --fail --location --show-error --connect-timeout 10 --max-time 600 --retry 2 --retry-all-errors -o "${tmp_file}"; then
+    rm -f -- "${tmp_file}"
+    printf '%s[ERROR]%s Failed to download %s\n' "${RED}" "${NC}" "${description}"
+    return 1
+  fi
 
-    downloaded_md5="$(md5sum "${tmp_file}" | cut -d' ' -f1)"
-    if [[ "${downloaded_md5}" != "${expected_md5}" ]]; then
-      rm -f "${tmp_file}"
-      printf '%s[ERROR]%s Downloaded checksum mismatch for %s\n' "${RED}" "${NC}" "${description}"
-      return 1
-    fi
-    mv -f "${tmp_file}" "${dest_path}" || return 1
+  downloaded_md5="$(md5sum "${tmp_file}" | cut -d' ' -f1)"
+  if [[ "${downloaded_md5}" != "${expected_md5}" ]]; then
+    rm -f -- "${tmp_file}"
+    printf '%s[ERROR]%s Downloaded checksum mismatch for %s\n' "${RED}" "${NC}" "${description}"
+    return 1
+  fi
+  mv -f -- "${tmp_file}" "${dest_path}" || return 1
 
-    local size="$(stat -c%s "${dest_path}" 2>/dev/null || printf '0')"
-    if [[ "${quiet}" == "false" ]]; then
-      printf '%s[FINISHED]%s %s (%s)\n\n' "${GREEN}" "${NC}" "${description}" "$(format_bytes "${size}")"
-    fi
-    return 0
-  done
-
-  printf '%s[ERROR]%s Still getting 401 after re‑authentication. Please try again.\n' "${RED}" "${NC}"
-  return 1
+  size="$(stat -c%s "${dest_path}" 2>/dev/null || printf '0')"
+  if [[ "${quiet}" == "false" ]]; then
+    printf '%s[FINISHED]%s %s (%s)\n\n' "${GREEN}" "${NC}" "${description}" "$(format_bytes "${size}")"
+  fi
+  return 0
 }
 
 check_server_status() {
   debug "Checking server status..."
-  local response="$(curl -s --connect-timeout 10 --max-time 30 \
-    -H "Authorization: Bearer ${authToken}" \
+  local response=""
+  if ! response="$(curl_authenticated "${authToken}" -sS --connect-timeout 10 --max-time 30 \
     -H "User-Agent: EbonholdLauncher/1.0" \
     -H "Accept: application/json" \
     -H "X-Client-Id: EbonholdLauncher" \
-    "${status_api}")"
+    "${status_api}")"; then
+    printf '%s[WARN]%s Could not retrieve server status.\n' "${YELLOW}" "${NC}"
+    return 0
+  fi
   if [[ -z "${response}" ]] || ! jq -e '.success' <<<"${response}" >/dev/null 2>&1; then
     printf '%s[WARN]%s Could not retrieve server status.\n' "${YELLOW}" "${NC}"
     return 0
@@ -436,14 +872,15 @@ collect_core_files() {
 }
 
 fetch_addon_catalog() {
-  addon_catalog="$(curl -s --connect-timeout 10 --max-time 60 \
-    -H "Authorization: Bearer ${authToken}" \
+  if ! addon_catalog="$(curl_authenticated "${authToken}" -sS --connect-timeout 10 --max-time 60 \
     -H "User-Agent: EbonholdLauncher/1.0" \
     -H "Accept: application/json" \
     -H "X-Client-Id: EbonholdLauncher" \
     -H "Origin: https://project-ebonhold.com" \
     -H "Referer: https://project-ebonhold.com/download" \
-    "${addons_api}")"
+    "${addons_api}")"; then
+    error 1 "Could not retrieve the addon catalog."
+  fi
 
   [[ -n "${addon_catalog}" ]] && jq -e '.success == true and (.addons | type == "array")' <<<"${addon_catalog}" >/dev/null 2>&1 || error 1 "Could not retrieve the addon catalog."
 }
@@ -746,14 +1183,15 @@ download_addons() {
     IFS=,
     printf '%s' "${addon_ids[*]}"
   )"
-  response="$(curl -s --connect-timeout 10 --max-time 60 \
-    -H "Authorization: Bearer ${authToken}" \
+  if ! response="$(curl_authenticated "${authToken}" -sS --connect-timeout 10 --max-time 60 \
     -H "User-Agent: EbonholdLauncher/1.0" \
     -H "Accept: application/json" \
     -H "X-Client-Id: EbonholdLauncher" \
     -H "Origin: https://project-ebonhold.com" \
     -H "Referer: https://project-ebonhold.com/download" \
-    "${addon_download_base}${ids}")"
+    "${addon_download_base}${ids}")"; then
+    error 1 "Could not retrieve addon download URLs."
+  fi
   [[ -n "${response}" ]] && jq -e '.success == true and (.files | type == "array")' <<<"${response}" >/dev/null 2>&1 || error 1 "Could not retrieve addon download URLs."
 
   while read -r file_id; do
@@ -771,7 +1209,7 @@ download_addons() {
     [[ "${file_id}" =~ ^[1-9][0-9]*$ && "${filename}" == Interface/AddOns/*.zip && "${url}" == https://* ]] || error 1 "Received an invalid addon download response."
     addon_name="$(jq -r --argjson id "${file_id}" '.addons[] | select(.id == $id) | .name' <<<"${addon_catalog}")"
     archive="$(mktemp)" || error 1 "Could not create addon download file."
-    if ! curl --fail --location --show-error --connect-timeout 10 --max-time 600 --retry 2 --retry-all-errors "${url}" -o "${archive}"; then
+    if ! curl_url "${url}" --fail --location --show-error --connect-timeout 10 --max-time 600 --retry 2 --retry-all-errors -o "${archive}"; then
       rm -f "${archive}"
       error 1 "Failed to download addon ${addon_name}."
     fi
@@ -1121,31 +1559,78 @@ update_files() {
   fi
 
   local failed=0
-  declare -a pids=()
+  local auth_retry_used=false
+  local result=0
+  local i=0
+  local -a pending_tasks=("${download_tasks[@]}")
+  local -a pids=()
+  local -a pid_tasks=()
+  local -a auth_retry_tasks=()
 
-  for task in "${download_tasks[@]}"; do
-    id="${task%%|*}"
-    rest="${task#*|}"
-    dest="${rest%%|*}"
-    rest="${rest#*|}"
-    path="${rest%%|*}"
-    expected_md5="${rest#*|}"
+  while [[ ${#pending_tasks[@]} -gt 0 ]]; do
+    pids=()
+    pid_tasks=()
+    auth_retry_tasks=()
 
-    (
-      download_file_by_id "$id" "$dest" "$path" "$expected_md5"
-    ) &
-    pids+=("$!")
+    for task in "${pending_tasks[@]}"; do
+      id="${task%%|*}"
+      rest="${task#*|}"
+      dest="${rest%%|*}"
+      rest="${rest#*|}"
+      path="${rest%%|*}"
+      expected_md5="${rest#*|}"
 
-    if [[ ${#pids[@]} -ge ${parallel} ]]; then
-      for p in "${pids[@]}"; do
-        wait "$p" || failed=$((failed + 1))
-      done
-      pids=()
+      (
+        download_file_by_id "${id}" "${dest}" "${path}" "${expected_md5}"
+      ) &
+      pids+=("$!")
+      pid_tasks+=("${task}")
+
+      if [[ ${#pids[@]} -ge ${parallel} ]]; then
+        for i in "${!pids[@]}"; do
+          if wait "${pids[$i]}"; then
+            :
+          else
+            result=$?
+            if [[ ${result} -eq 2 && "${auth_retry_used}" == "false" ]]; then
+              auth_retry_tasks+=("${pid_tasks[$i]}")
+            else
+              failed=$((failed + 1))
+            fi
+          fi
+        done
+        pids=()
+        pid_tasks=()
+      fi
+    done
+
+    for i in "${!pids[@]}"; do
+      if wait "${pids[$i]}"; then
+        :
+      else
+        result=$?
+        if [[ ${result} -eq 2 && "${auth_retry_used}" == "false" ]]; then
+          auth_retry_tasks+=("${pid_tasks[$i]}")
+        else
+          failed=$((failed + 1))
+        fi
+      fi
+    done
+
+    if [[ ${#auth_retry_tasks[@]} -gt 0 && "${auth_retry_used}" == "false" ]]; then
+      debug "One or more downloads received 401; coordinating one parent re-authentication."
+      acquire_auth_lock || error 1 "Could not coordinate authentication renewal for downloads."
+      renew_auth=true
+      manage_token
+      result=$?
+      renew_auth=false
+      release_auth_lock
+      [[ ${result} -eq 0 ]] || error 1 "Could not renew authentication for downloads."
+      auth_retry_used=true
+      pending_tasks=("${auth_retry_tasks[@]}")
+      continue
     fi
-  done
-
-  for p in "${pids[@]}"; do
-    wait "$p" || failed=$((failed + 1))
+    break
   done
 
   if [[ $failed -gt 0 ]]; then
@@ -1264,6 +1749,12 @@ for arg in "${@}"; do
     dry_run=true
     debug "Dry-run mode enabled"
     ;;
+  --relogin)
+    relogin=true
+    ;;
+  --forget-login)
+    forget_login=true
+    ;;
   --help)
     cat <<EOF
 Usage: $0 [OPTIONS] [--] [game arguments]
@@ -1284,6 +1775,8 @@ Options:
                     Remove comma-separated installed addon names or IDs
   --addons=LIST     Download comma-separated addon names or IDs
   --quiet           Suppress routine output; warnings and errors remain
+  --relogin         Ignore cached/saved login and request a fresh manual login
+  --forget-login    Remove this installation's cached token and keyring login
   --help            Show this help message
 
 Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet -- %command%
@@ -1327,7 +1820,26 @@ if [[ ("${remove_addons_only}" == "true" || -n "${remove_addons}") && ("${status
   error 1 "Addon removal cannot be combined with update, addon, or game-launch options."
 fi
 
+if [[ "${forget_login}" == "true" && ("${relogin}" == "true" || "${verify_only}" == "true" || "${dry_run}" == "true" || "${status_only}" == "true" || "${quick}" == "true" || "${full}" == "true" || "${list_addons_only}" == "true" || "${check_addons_only}" == "true" || "${select_addons}" == "true" || "${remove_addons_only}" == "true" || -n "${addons}" || -n "${remove_addons}" || $# -gt 0) ]]; then
+  error 1 "--forget-login cannot be combined with another mode or game arguments."
+fi
+
+if [[ "${relogin}" == "true" && ("${forget_login}" == "true" || "${verify_only}" == "true" || "${dry_run}" == "true") ]]; then
+  error 1 "--relogin cannot be combined with --forget-login, --verify, or --dry-run."
+fi
+
+if [[ "${forget_login}" == "true" ]]; then
+  if ! forget_login_state; then
+    error 1 "Login forget was incomplete; see the warning above and retry after fixing the reported keyring or file issue."
+  fi
+  exit 0
+fi
+
+acquire_auth_lock || error 1 "Could not coordinate authentication."
 manage_token
+manage_result=$?
+release_auth_lock
+[[ ${manage_result} -eq 0 ]] || error 1 "Authentication failed."
 
 check_server_status
 
@@ -1411,5 +1923,6 @@ if [[ ${#} -gt 0 ]]; then
     unset TZ
     export PROTON_FORCE_LARGE_ADDRESS_AWARE=1 WINE_LARGE_ADDRESS_AWARE=1
   fi
+  unset authToken games_manifest login_token saved_password
   exec "${@}"
 fi
