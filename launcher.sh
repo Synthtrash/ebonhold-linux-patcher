@@ -49,11 +49,10 @@ addons_api="https://api.project-ebonhold.com/api/launcher/addons"
 addon_download_base="https://api.project-ebonhold.com/api/launcher/addons/download?addon_ids="
 token_file="${targetdir}/.updaterToken"
 addon_state_file="${targetdir}/Interface/AddOns/.ebonhold-launcher-addons.json"
-account_hint_key="username"
-keyring_service="com.project-ebonhold.updater"
+saved_login_dir="${targetdir}/.ebonhold-login"
+saved_login_file="${saved_login_dir}/credentials.json"
 installation_identity="$(realpath -e "${targetdir}" 2>/dev/null || realpath -m "${targetdir}")"
 installation_key="$(printf '%s' "${installation_identity}" | sha256sum | cut -d' ' -f1)"
-keyring_tool="$(command -v secret-tool 2>/dev/null || true)"
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
   auth_lock_dir="${XDG_RUNTIME_DIR}/ebonhold-updater"
 else
@@ -241,96 +240,53 @@ release_auth_lock() {
   auth_lock_fd=""
 }
 
-account_key_for_user() {
-  local username="$1"
-  [[ -n "${username}" ]] || return 1
-  printf '%s' "${username}" | sha256sum | cut -d' ' -f1
-}
-
-keyring_lookup_secret() {
-  local kind="$1"
-  local account="${2:-}"
-  [[ -n "${keyring_tool}" ]] || return 3
-  if [[ -n "${account}" ]]; then
-    "${keyring_tool}" lookup service "${keyring_service}" installation "${installation_identity}" \
-      kind "${kind}" account "${account}" 2>/dev/null
-  else
-    "${keyring_tool}" lookup service "${keyring_service}" installation "${installation_identity}" \
-      kind "${kind}" 2>/dev/null
-  fi
-}
-
-keyring_store_secret() {
-  local kind="$1"
-  local secret="$2"
-  local account="${3:-}"
-  is_read_only_mode && return 1
-  [[ -n "${keyring_tool}" ]] || return 1
-  if [[ -n "${account}" ]]; then
-    printf '%s' "${secret}" |
-      "${keyring_tool}" store --label="Ebonhold Updater login" \
-        service "${keyring_service}" installation "${installation_identity}" kind "${kind}" account "${account}" \
-        >/dev/null 2>&1
-  else
-    printf '%s' "${secret}" |
-      "${keyring_tool}" store --label="Ebonhold Updater account" \
-        service "${keyring_service}" installation "${installation_identity}" kind "${kind}" \
-        >/dev/null 2>&1
-  fi
-}
-
-keyring_clear_secret() {
-  local kind="$1"
-  local account="${2:-}"
-  [[ -n "${keyring_tool}" ]] || return 1
-  if [[ -n "${account}" ]]; then
-    "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" \
-      kind "${kind}" account "${account}" >/dev/null 2>&1
-  else
-    "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" \
-      kind "${kind}" >/dev/null 2>&1
-  fi
-}
-
-keyring_clear_installation() {
-  [[ -n "${keyring_tool}" ]] || return 1
-  "${keyring_tool}" clear service "${keyring_service}" installation "${installation_identity}" >/dev/null 2>&1
+saved_login_directory_is_safe() {
+  [[ -O "${targetdir}" ]] && lock_parent_is_safe "${targetdir}" &&
+    private_runtime_directory "${saved_login_dir}"
 }
 
 load_saved_credentials() {
-  local saved_account=""
+  local credentials
 
   saved_username=""
   saved_password=""
-  [[ -n "${keyring_tool}" ]] || return 3
-  if ! saved_username="$(keyring_lookup_secret "${account_hint_key}")" || [[ -z "${saved_username}" ]]; then
-    saved_username=""
-    return 1
-  fi
-  saved_account="$(account_key_for_user "${saved_username}")" || {
-    saved_username=""
-    return 1
-  }
-  if ! saved_password="$(keyring_lookup_secret password "${saved_account}")" || [[ -z "${saved_password}" ]]; then
-    saved_username=""
-    saved_password=""
-    return 1
-  fi
-  return 0
+  saved_login_directory_is_safe || return 1
+  [[ -f "${saved_login_file}" && ! -L "${saved_login_file}" && -O "${saved_login_file}" ]] || return 1
+  [[ "$(stat -c '%a:%h' "${saved_login_file}" 2>/dev/null)" == "600:1" ]] || return 1
+  credentials="$(<"${saved_login_file}")" || return 1
+  jq -se 'length == 1 and (.[0] | type == "object" and all(.username, .password; type == "string" and length > 0 and (index("\u0000") == null)))' \
+    <<<"${credentials}" >/dev/null 2>&1 || return 1
+  {
+    IFS= read -r -d '' saved_username && IFS= read -r -d '' saved_password
+  } < <(jq -j '.username, "\u0000", .password, "\u0000"' <<<"${credentials}")
 }
 
-save_credentials_to_keyring() {
+save_credentials_locally() {
   local username="$1"
   local password="$2"
-  local account
+  local credentials
 
-  account="$(account_key_for_user "${username}")" || return 1
-  keyring_store_secret "${account_hint_key}" "${username}" || return 1
-  if ! keyring_store_secret password "${password}" "${account}"; then
-    keyring_clear_secret "${account_hint_key}" || true
-    return 1
+  is_read_only_mode && return 1
+  [[ -n "${username}" && -n "${password}" && -O "${targetdir}" ]] || return 1
+  lock_parent_is_safe "${targetdir}" || return 1
+  if [[ ! -e "${saved_login_dir}" && ! -L "${saved_login_dir}" ]]; then
+    (
+      umask 077
+      mkdir -- "${saved_login_dir}"
+    ) || return 1
   fi
-  return 0
+  saved_login_directory_is_safe || return 1
+  credentials="$(printf '%s' "${password}" |
+    jq -n --arg username "${username}" --rawfile password /dev/stdin \
+      '{username: $username, password: $password}')" || return 1
+  write_private_credential "${saved_login_file}" "${credentials}"
+}
+
+clear_saved_credentials() {
+  is_read_only_mode && return 1
+  [[ ! -e "${saved_login_dir}" && ! -L "${saved_login_dir}" ]] && return 0
+  saved_login_directory_is_safe || return 1
+  rm -f -- "${saved_login_file}"
 }
 
 safe_destination() {
@@ -439,7 +395,7 @@ authenticate_with_credentials() {
 
 prompt_remember_login() {
   local answer=""
-  local warning_text="Remember me on this computer? Your password will be stored in your desktop keyring. Only enable this on a computer you trust."
+  local warning_text="Remember me on this computer? Your username and password will be stored unencrypted in ${saved_login_file} (file permissions 600, private directory 700). Other programs running as you can read them. Only enable this on a computer you trust."
 
   remember_login=false
   if [[ "${GUI}" == "true" ]]; then
@@ -470,15 +426,11 @@ save_manual_login_if_requested() {
 
   is_read_only_mode && return 0
   [[ "${remember_login:-false}" == "true" ]] || return 0
-  if [[ -z "${keyring_tool}" ]]; then
-    warn "Remember me was not saved: the optional secret-tool desktop-keyring helper is unavailable. The launcher will continue without storing your password."
+  if ! save_credentials_locally "${username}" "${password}"; then
+    warn "Remember me was not saved: could not securely write ${saved_login_file}. Check ownership and permissions; symlinked paths are refused."
     return 0
   fi
-  if ! save_credentials_to_keyring "${username}" "${password}"; then
-    warn "Remember me was not saved because the desktop keyring is unavailable or locked. The launcher will continue without storing your password."
-    return 0
-  fi
-  debug "Remembered login stored in the desktop keyring for this installation."
+  debug "Remembered login stored locally for this installation (file permissions: 600)."
 }
 
 manage_token() {
@@ -487,7 +439,6 @@ manage_token() {
   local pass=""
   local manifest_result=0
   local login_result=0
-  local had_cached_token=false
   local force_renew="${renew_auth}"
   local remember_login=false
 
@@ -502,7 +453,6 @@ manage_token() {
       token=""
     fi
   fi
-  [[ -n "${token}" ]] && had_cached_token=true
 
   if [[ "${relogin}" != "true" && "${force_renew}" != "true" && -n "${token}" ]]; then
     debug "Auth token found, verifying token."
@@ -525,9 +475,9 @@ manage_token() {
     debug "Forced authentication renewal requested; the cached token will not be reused."
   fi
 
-  if [[ "${relogin}" != "true" && -n "${keyring_tool}" ]]; then
+  if [[ "${relogin}" != "true" ]]; then
     if load_saved_credentials; then
-      debug "Trying the opted-in desktop-keyring login once."
+      debug "Trying the opted-in local saved login once."
       if authenticate_with_credentials "${saved_username}" "${saved_password}"; then
         login_result=0
       else
@@ -540,19 +490,17 @@ manage_token() {
         persist_authenticated_token "${login_token}" || error 1 "Authenticated successfully, but could not securely write ${token_file}."
         authToken="${login_token}"
         unset saved_username saved_password
-        debug "Saved desktop-keyring login succeeded."
+        debug "Saved local login succeeded."
         return 0
       elif [[ ${login_result} -eq 1 ]]; then
-        error 1 "Saved desktop-keyring login could not reach the authentication service.\n${login_error}"
+        error 1 "Saved local login could not reach the authentication service.\n${login_error}"
       else
-        warn "The saved desktop-keyring login was rejected. Please sign in manually; it will not be retried automatically."
+        warn "The saved local login was rejected. Please sign in manually; it will not be retried automatically."
       fi
       unset saved_username saved_password
-    elif [[ ${had_cached_token} == true ]]; then
-      warn "The saved desktop-keyring login is unavailable or locked. Continuing with one manual login attempt."
+    elif [[ -e "${saved_login_file}" || -L "${saved_login_file}" || -L "${saved_login_dir}" ]]; then
+      warn "The saved local login is missing, invalid, or has unsafe ownership or permissions. Please sign in manually."
     fi
-  elif [[ ${had_cached_token} == true && -z "${keyring_tool}" ]]; then
-    warn "The optional secret-tool desktop-keyring helper is unavailable. Continuing with one manual login attempt."
   fi
 
   debug "No valid token found. Please log in."
@@ -584,9 +532,9 @@ manage_token() {
     prompt_remember_login
   fi
   persist_authenticated_token "${login_token}" || error 1 "Authenticated successfully, but could not securely write ${token_file}."
-  if ! is_read_only_mode && [[ "${remember_login}" == "false" && -n "${keyring_tool}" ]]; then
-    if ! keyring_clear_installation; then
-      warn "The previous desktop-keyring login could not be cleared. Use --forget-login and try again."
+  if ! is_read_only_mode && [[ "${remember_login}" == "false" ]]; then
+    if ! clear_saved_credentials; then
+      warn "The previous saved local login could not be cleared. Use --forget-login and try again."
     fi
   fi
   save_manual_login_if_requested "${user}" "${pass}"
@@ -611,11 +559,8 @@ forget_login_state() {
     fi
   fi
 
-  if [[ -z "${keyring_tool}" ]]; then
-    warn "Could not clear desktop-keyring credentials: secret-tool is unavailable."
-    failed=true
-  elif ! keyring_clear_installation; then
-    warn "Could not clear desktop-keyring credentials for this installation. The keyring may be locked; retry --forget-login after unlocking it."
+  if ! clear_saved_credentials; then
+    warn "Could not clear saved local credentials: ${saved_login_file}. Check ownership and permissions; symlinked directories are refused."
     failed=true
   fi
   release_auth_lock
@@ -623,7 +568,7 @@ forget_login_state() {
   if [[ "${failed}" == "true" ]]; then
     return 1
   fi
-  [[ "${quiet}" == "true" ]] || printf 'Forgot the cached updater token and desktop-keyring login for this installation.\n'
+  [[ "${quiet}" == "true" ]] || printf 'Forgot the cached updater token and saved local login for this installation.\n'
   return 0
 }
 
@@ -1776,7 +1721,7 @@ Options:
   --addons=LIST     Download comma-separated addon names or IDs
   --quiet           Suppress routine output; warnings and errors remain
   --relogin         Ignore cached/saved login and request a fresh manual login
-  --forget-login    Remove this installation's cached token and keyring login
+  --forget-login    Remove this installation's cached token and saved local login
   --help            Show this help message
 
 Default mode updates all required common and game files. For Steam, use: ./launcher.sh --quick --quiet -- %command%
@@ -1830,7 +1775,7 @@ fi
 
 if [[ "${forget_login}" == "true" ]]; then
   if ! forget_login_state; then
-    error 1 "Login forget was incomplete; see the warning above and retry after fixing the reported keyring or file issue."
+    error 1 "Login forget was incomplete; see the warning above and retry after fixing the reported file issue."
   fi
   exit 0
 fi
