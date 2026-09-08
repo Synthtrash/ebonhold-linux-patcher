@@ -35,88 +35,9 @@ cat >"${mock_bin}/secret-tool" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-store_dir="${MOCK_KEYRING_DIR:?}"
-log_file="${KEYRING_LOG:?}"
-index_file="${store_dir}/index"
-command_name="${1:-}"
-shift || true
-service=""
-installation=""
-kind=""
-account=""
-while (($#)); do
-  case "$1" in
-  service)
-    service="$2"
-    shift 2
-    ;;
-  installation)
-    installation="$2"
-    shift 2
-    ;;
-  kind)
-    kind="$2"
-    shift 2
-    ;;
-  account)
-    account="$2"
-    shift 2
-    ;;
-  *)
-    shift
-    ;;
-  esac
-done
-printf '%s service=%s installation=%s kind=%s account=%s\n' \
-  "${command_name}" "${service}" "${installation}" "${kind}" "${account}" >>"${log_file}"
-
-if [[ "${MOCK_KEYRING_LOCKED:-false}" == "true" ]]; then
-  exit 1
-fi
-item_key="$(printf '%s\n' "${service}" "${installation}" "${kind}" "${account}" | sha256sum | cut -d' ' -f1)"
-
-case "${command_name}" in
-store)
-  secret_tmp="$(mktemp "${store_dir}/.secret.XXXXXX")"
-  cat >"${secret_tmp}"
-  chmod 600 "${secret_tmp}"
-  mv -f -- "${secret_tmp}" "${store_dir}/${item_key}"
-  index_tmp="$(mktemp "${store_dir}/.index.XXXXXX")"
-  if [[ -f "${index_file}" ]]; then
-    while IFS=$'\t' read -r old_key old_service old_installation old_kind old_account; do
-      [[ "${old_key}" == "${item_key}" ]] && continue
-      printf '%s\t%s\t%s\t%s\t%s\n' "${old_key}" "${old_service}" "${old_installation}" "${old_kind}" "${old_account}" >>"${index_tmp}"
-    done <"${index_file}"
-  fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "${item_key}" "${service}" "${installation}" "${kind}" "${account}" >>"${index_tmp}"
-  mv -f -- "${index_tmp}" "${index_file}"
-  ;;
-lookup)
-  [[ -f "${store_dir}/${item_key}" ]] || exit 1
-  cat "${store_dir}/${item_key}"
-  ;;
-clear)
-  [[ "${MOCK_KEYRING_CLEAR_FAIL:-false}" == "true" ]] && exit 1
-  index_tmp="$(mktemp "${store_dir}/.index.XXXXXX")"
-  if [[ -f "${index_file}" ]]; then
-    while IFS=$'\t' read -r old_key old_service old_installation old_kind old_account; do
-      match=true
-      [[ "${old_service}" == "${service}" && "${old_installation}" == "${installation}" ]] || match=false
-      [[ -z "${kind}" || "${old_kind}" == "${kind}" ]] || match=false
-      [[ -z "${account}" || "${old_account}" == "${account}" ]] || match=false
-      if [[ "${match}" == "true" ]]; then
-        rm -f -- "${store_dir}/${old_key}"
-      else
-        printf '%s\t%s\t%s\t%s\t%s\n' "${old_key}" "${old_service}" "${old_installation}" "${old_kind}" "${old_account}" >>"${index_tmp}"
-      fi
-    done <"${index_file}"
-  fi
-  mv -f -- "${index_tmp}" "${index_file}"
-  ;;
-*)
-  exit 2
-  ;;
-esac
+# A locked wallet must never be contacted, even if secret-tool is installed.
+printf 'Unexpected wallet access\n' >>"${KEYRING_LOG:?}"
+exit 1
 EOF
 chmod +x "${mock_bin}/secret-tool"
 
@@ -164,6 +85,10 @@ code="200"
 case "${url}" in
 *'/api/auth/login')
   request_body="$(cat)"
+  if [[ -n "${MOCK_EXPECT_PASSWORD:-}" ]]; then
+    jq -e '.username == env.MOCK_EXPECT_USER and .password == env.MOCK_EXPECT_PASSWORD' \
+      <<<"${request_body}" >/dev/null || exit 2
+  fi
   if [[ "${MOCK_BLOCK_LOGIN:-false}" == "true" ]]; then
     : >"${MOCK_BLOCK_MARKER:?}"
     while [[ ! -e "${MOCK_BLOCK_RELEASE:?}" ]]; do
@@ -250,7 +175,7 @@ run_launcher() {
   local client="$1"
   shift
   XDG_RUNTIME_DIR="${MOCK_RUNTIME_DIR:-${runtime_dir}}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_bin}:${PATH}" \
-    MOCK_KEYRING_DIR="${state_dir}/keyring" KEYRING_LOG="${state_dir}/keyring.log" \
+    KEYRING_LOG="${state_dir}/keyring.log" \
     ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" \
     remember_login="${remember_login:-}" \
     MOCK_USER="${MOCK_USER:-test-user}" MOCK_PASSWORD="${MOCK_PASSWORD:-manual-pass}" \
@@ -266,6 +191,14 @@ run_launcher() {
     "${client}/launcher.sh" "$@"
 }
 
+run_headless() {
+  local client="$1"
+  shift
+  XDG_RUNTIME_DIR="${runtime_dir}" XDG_SESSION_TYPE='' DISPLAY='' WAYLAND_DISPLAY='' GUI=false PATH="${mock_bin}:${PATH}" \
+    KEYRING_LOG="${state_dir}/keyring.log" ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" \
+    "${client}/launcher.sh" "$@" </dev/null
+}
+
 seed_saved_client() {
   local client="$1"
   MOCK_REMEMBER=true MOCK_PASSWORD=saved-pass run_launcher "${client}" --status >/dev/null
@@ -275,86 +208,152 @@ zenity_prompt_count() {
   grep -Ec '^--(entry|password)' "${state_dir}/zenity.log" || true
 }
 
-keyring_log_lines() {
-  wc -l <"${state_dir}/keyring.log"
-}
-
-keyring_appended_count() {
-  local start_line="$1"
-  local pattern="$2"
-  local appended
-
-  appended="$(tail -n +$((start_line + 1)) "${state_dir}/keyring.log")"
-  grep -Ec "${pattern}" <<<"${appended}" || true
-}
-
-assert_no_new_keyring_mutations() {
-  local start_line="$1"
-
-  [[ "$(keyring_appended_count "${start_line}" '^store ')" -eq 0 &&
-  "$(keyring_appended_count "${start_line}" '^clear ')" -eq 0 ]]
-}
-
 installation_key_for_client() {
   local client="$1"
 
   printf '%s' "$(realpath -e "${client}")" | sha256sum | cut -d' ' -f1
 }
 
-mkdir -p "${state_dir}/keyring"
 : >"${state_dir}/keyring.log"
 : >"${state_dir}/zenity.log"
 : >"${state_dir}/curl.log"
 
-# Explicit opt-out: authenticate, cache only the token, and do not call keyring store.
+# Remembered login must survive a new headless launch with an unavailable wallet.
+client_no_wallet="$(new_client no-wallet)"
+MOCK_REMEMBER=true MOCK_PASSWORD=saved-pass run_launcher "${client_no_wallet}" --status >/dev/null
+printf '%s' old-token >"${client_no_wallet}/.updaterToken"
+if ! MOCK_EXPIRE_OLD_TOKEN=true MOCK_EXPECT_USER=test-user MOCK_EXPECT_PASSWORD=saved-pass \
+  run_headless "${client_no_wallet}" --status >"${state_dir}/no-wallet.out" 2>&1; then
+  printf 'FAIL: remembered login cannot renew an expired token headlessly with an unavailable wallet.\n' >&2
+  exit 1
+fi
+[[ "$(<"${client_no_wallet}/.updaterToken")" == "new-token" ]]
+
+# Explicit opt-out caches only a private token, even with a permissive umask.
 client_optout="$(new_client optout)"
 MOCK_REMEMBER=false run_launcher "${client_optout}" --status >/dev/null
 [[ "$(<"${client_optout}/.updaterToken")" == "new-token" ]]
 [[ "$(stat -c '%a' "${client_optout}/.updaterToken")" == "600" ]]
-! grep -q '^store ' "${state_dir}/keyring.log"
+[[ ! -e "${client_optout}/.ebonhold-login" ]]
 
-# Explicit opt-in stores username and password only through secret-tool stdin.
+# Explicit opt-in stores a private directory and an atomic, private JSON file.
 client_saved="$(new_client saved)"
-MOCK_REMEMBER=true MOCK_PASSWORD=saved-pass run_launcher "${client_saved}" --status >/dev/null
-[[ -f "${state_dir}/keyring/index" ]]
-saved_account="$(printf '%s' test-user | sha256sum | cut -d' ' -f1)"
-[[ "$(grep -c "password" "${state_dir}/keyring/index")" -eq 1 ]]
-[[ "$(<"${state_dir}/keyring/$(printf '%s\n' com.project-ebonhold.updater "$(realpath -e "${client_saved}")" password "${saved_account}" | sha256sum | cut -d' ' -f1)")" == "saved-pass" ]]
-! grep -q 'manual-pass\|new-token' "${state_dir}/keyring.log"
+(
+  umask 000
+  MOCK_REMEMBER=true MOCK_PASSWORD=saved-pass run_launcher "${client_saved}" --status >/dev/null
+)
+[[ "$(stat -c '%a' "${client_saved}/.ebonhold-login")" == 700 ]]
+[[ "$(stat -c '%a:%h' "${client_saved}/.ebonhold-login/credentials.json")" == 600:1 ]]
+jq -e '.username == "test-user" and .password == "saved-pass"' "${client_saved}/.ebonhold-login/credentials.json" >/dev/null
 
-# A valid cached token short-circuits both keyring lookup and login.
-cp "${state_dir}/keyring.log" "${state_dir}/keyring.before-cache"
+# A valid cached token short-circuits saved login, even if the saved file is invalid.
+cp "${client_saved}/.ebonhold-login/credentials.json" "${state_dir}/saved.before-cache"
+printf broken >"${client_saved}/.ebonhold-login/credentials.json"
 cp "${state_dir}/zenity.log" "${state_dir}/zenity.before-cache"
 run_launcher "${client_saved}" --status >/dev/null
-cmp -s "${state_dir}/keyring.log" "${state_dir}/keyring.before-cache"
 cmp -s "${state_dir}/zenity.log" "${state_dir}/zenity.before-cache"
+cp "${state_dir}/saved.before-cache" "${client_saved}/.ebonhold-login/credentials.json"
 
 # Expiry uses saved credentials exactly once and writes a replacement token.
 printf '%s' old-token >"${client_saved}/.updaterToken"
 MOCK_EXPIRE_OLD_TOKEN=true run_launcher "${client_saved}" --status >/dev/null
 [[ "$(<"${client_saved}/.updaterToken")" == "new-token" ]]
 
+# JSON round-trips special characters, spaces, and embedded newlines without shell evaluation.
+client_special="$(new_client 'special characters')"
+special_user='user "name" \\ $USER'
+special_password=$'  pass "word" \\\n$(false) `false` | *  '
+MOCK_USER="${special_user}" MOCK_PASSWORD="${special_password}" MOCK_REMEMBER=true \
+  run_launcher "${client_special}" --status >/dev/null
+rm "${client_special}/.updaterToken"
+MOCK_EXPECT_USER="${special_user}" MOCK_EXPECT_PASSWORD="${special_password}" \
+  run_headless "${client_special}" --status >/dev/null
+
+# Unsafe or malformed credentials must not be sent to the API or modified on a headless run.
+storage_hash="$(printf payload | md5sum | cut -d' ' -f1 | xxd -r -p | base64 -w0)"
+for unsafe in file-mode directory-mode parent-mode file-link directory-link hardlink fifo malformed empty nonstring nul multiple; do
+  client_unsafe="$(new_client "unsafe-${unsafe}")"
+  seed_saved_client "${client_unsafe}"
+  saved_file="${client_unsafe}/.ebonhold-login/credentials.json"
+  printf '%s' old-token >"${client_unsafe}/.updaterToken"
+  case "${unsafe}" in
+  file-mode) chmod 644 "${saved_file}" ;;
+  directory-mode) chmod 755 "${client_unsafe}/.ebonhold-login" ;;
+  parent-mode) chmod 777 "${client_unsafe}" ;;
+  file-link)
+    mv "${saved_file}" "${test_root}/credential-victim"
+    ln -s "${test_root}/credential-victim" "${saved_file}"
+    ;;
+  directory-link)
+    mv "${client_unsafe}/.ebonhold-login" "${test_root}/directory-victim"
+    ln -s "${test_root}/directory-victim" "${client_unsafe}/.ebonhold-login"
+    ;;
+  hardlink) ln "${saved_file}" "${test_root}/credential-hardlink" ;;
+  fifo)
+    rm "${saved_file}"
+    mkfifo "${saved_file}"
+    ;;
+  malformed) printf '{broken' >"${saved_file}" ;;
+  empty) printf '{"username":"test-user","password":""}' >"${saved_file}" ;;
+  nonstring) printf '{"username":"test-user","password":42}' >"${saved_file}" ;;
+  nul) printf '%s' '{"username":"test-user","password":"saved\u0000pass"}' >"${saved_file}" ;;
+  multiple) printf '%s' '{"username":"test-user","password":"saved-pass"} {}' >"${saved_file}" ;;
+  esac
+  login_before_unsafe="$(grep -c '/api/auth/login' "${state_dir}/curl.log")"
+  if MOCK_EXPIRE_OLD_TOKEN=true run_headless "${client_unsafe}" --status >"${state_dir}/unsafe.out" 2>&1; then
+    printf 'Unsafe credentials accepted: %s\n' "${unsafe}" >&2
+    exit 1
+  fi
+  [[ "$(grep -c '/api/auth/login' "${state_dir}/curl.log")" == "${login_before_unsafe}" ]]
+  [[ "$(<"${client_unsafe}/.updaterToken")" == old-token ]]
+  case "${unsafe}" in
+  file-mode | directory-mode | parent-mode | file-link | directory-link | fifo)
+    # Read-only manual auth must also leave unsafe state untouched.
+    MOCK_EXPIRE_OLD_TOKEN=true MOCK_MANIFEST_KIND=files MOCK_HASH="${storage_hash}" \
+      run_launcher "${client_unsafe}" --dry-run --quick >/dev/null
+    case "${unsafe}" in
+    file-mode)
+      [[ "$(stat -c '%a' "${saved_file}")" == 644 ]]
+      continue
+      ;;
+    esac
+    # A writable relogin must refuse unsafe destinations and warn, not claim it saved.
+    unsafe_output="$(MOCK_REMEMBER=true run_launcher "${client_unsafe}" --relogin --status 2>&1)"
+    [[ "${unsafe_output}" == *"Remember me was not saved"* ]]
+    ;;
+  esac
+done
+jq -e '.password == "saved-pass"' "${test_root}/credential-victim" >/dev/null
+jq -e '.password == "saved-pass"' "${test_root}/directory-victim/credentials.json" >/dev/null
+
+# Failed manual authentication and read-only renewal preserve both saved credentials and token.
+client_preserved="$(new_client preserved-login)"
+seed_saved_client "${client_preserved}"
+mkdir "${client_preserved}/Data"
+printf payload >"${client_preserved}/Data/patch-a"
+printf payload >"${client_preserved}/Data/patch-b"
+printf '%s' old-token >"${client_preserved}/.updaterToken"
+cp "${client_preserved}/.ebonhold-login/credentials.json" "${state_dir}/preserved.json"
+if MOCK_REJECT_MANUAL=true MOCK_REMEMBER=true run_launcher "${client_preserved}" --relogin --status >/dev/null 2>&1; then
+  printf 'Rejected manual login unexpectedly succeeded.\n' >&2
+  exit 1
+fi
+for readonly_mode in --verify --dry-run; do
+  MOCK_EXPIRE_OLD_TOKEN=true MOCK_MANIFEST_KIND=files MOCK_HASH="${storage_hash}" \
+    run_headless "${client_preserved}" "${readonly_mode}" --quick >/dev/null
+  [[ "$(<"${client_preserved}/.updaterToken")" == old-token ]]
+  cmp -s "${state_dir}/preserved.json" "${client_preserved}/.ebonhold-login/credentials.json"
+done
+
 # Inherited remember_login=true cannot turn a normal opt-out into consent.
 client_inherited="$(new_client inherited-consent)"
-keyring_before_inherited="$(keyring_log_lines)"
 login_before_inherited="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 remember_login=true MOCK_REMEMBER=false run_launcher "${client_inherited}" --status >/dev/null
 login_after_inherited="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 [[ ${login_after_inherited} -gt ${login_before_inherited} ]]
-[[ "$(keyring_appended_count "${keyring_before_inherited}" '^store ')" -eq 0 ]]
-[[ "$(keyring_appended_count "${keyring_before_inherited}" '^clear ')" -eq 1 ]]
+[[ ! -e "${client_inherited}/.ebonhold-login" ]]
 
-# A writable opt-in fixture is a negative control: the mutation assertion must catch its stores.
-client_mutation_control="$(new_client mutation-control)"
-keyring_before_control="$(keyring_log_lines)"
-MOCK_REMEMBER=true MOCK_PASSWORD=control-pass run_launcher "${client_mutation_control}" --status >/dev/null
-if assert_no_new_keyring_mutations "${keyring_before_control}"; then
-  printf 'Keyring mutation negative control unexpectedly passed.\n' >&2
-  exit 1
-fi
-[[ "$(keyring_appended_count "${keyring_before_control}" '^store ')" -gt 0 ]]
-
-# A missing optional helper does not block manual login and reports the fallback.
+# Saving and forgetting work with no secret-tool installed, without network during forget.
 client_missing="$(new_client missing-keyring)"
 mock_path_without_secret="${test_root}/bin-no-secret"
 mkdir -p "${mock_path_without_secret}"
@@ -363,24 +362,20 @@ for utility in env bash basename dirname realpath sha256sum cut mktemp chmod sta
 done
 ln -s "${mock_bin}/curl" "${mock_path_without_secret}/curl"
 ln -s "${mock_bin}/zenity" "${mock_path_without_secret}/zenity"
-missing_output="$(XDG_RUNTIME_DIR= TMPDIR="${fallback_runtime_dir}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_path_without_secret}" \
+missing_output="$(XDG_RUNTIME_DIR='' TMPDIR="${fallback_runtime_dir}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_path_without_secret}" \
   ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" MOCK_REMEMBER=true \
   "${client_missing}/launcher.sh" --status 2>&1)"
-[[ "${missing_output}" == *"secret-tool desktop-keyring helper is unavailable"* ]]
+[[ "${missing_output}" != *"Remember me was not saved"* ]]
+[[ -f "${client_missing}/.ebonhold-login/credentials.json" ]]
 missing_curl_before="${state_dir}/curl.before-missing-forget"
 cp "${state_dir}/curl.log" "${missing_curl_before}"
-missing_forget_output="$(XDG_RUNTIME_DIR= TMPDIR="${fallback_runtime_dir}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_path_without_secret}" \
+missing_forget_output="$(XDG_RUNTIME_DIR='' TMPDIR="${fallback_runtime_dir}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_path_without_secret}" \
   ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" \
-  "${client_missing}/launcher.sh" --forget-login 2>&1 || true)"
+  "${client_missing}/launcher.sh" --forget-login 2>&1)"
 [[ ! -e "${client_missing}/.updaterToken" ]]
-[[ "${missing_forget_output}" == *"secret-tool is unavailable"* ]]
+[[ "${missing_forget_output}" == *"Forgot the cached updater token and saved local login"* ]]
+[[ ! -e "${client_missing}/.ebonhold-login/credentials.json" ]]
 cmp -s "${state_dir}/curl.log" "${missing_curl_before}"
-
-# Locked saved credentials fall back to one manual login attempt.
-client_locked="$(new_client locked-keyring)"
-printf '%s' old-token >"${client_locked}/.updaterToken"
-locked_output="$(MOCK_KEYRING_LOCKED=true MOCK_EXPIRE_OLD_TOKEN=true run_launcher "${client_locked}" --status 2>&1)"
-[[ "${locked_output}" == *"desktop-keyring login is unavailable or locked"* ]]
 
 # Saved account A is rejected, manual account B succeeds with Remember OFF, and A is cleared.
 client_rejected="$(new_client rejected-saved)"
@@ -388,15 +383,12 @@ MOCK_USER=account-a MOCK_PASSWORD=saved-pass MOCK_REMEMBER=true run_launcher "${
 printf '%s' old-token >"${client_rejected}/.updaterToken"
 client_remembered="$(new_client remembered-other-installation)"
 MOCK_USER=remembered-user MOCK_PASSWORD=remembered-pass MOCK_REMEMBER=true run_launcher "${client_remembered}" --status >/dev/null
-rejected_installation="$(realpath -e "${client_rejected}")"
-rejected_keyring_before="$(keyring_log_lines)"
 zenity_before_reject="$(zenity_prompt_count)"
 MOCK_USER=account-b MOCK_PASSWORD=manual-pass MOCK_REMEMBER=false MOCK_EXPIRE_OLD_TOKEN=true MOCK_REJECT_SAVED=true \
   run_launcher "${client_rejected}" --status >/dev/null
 zenity_after_reject="$(zenity_prompt_count)"
 ((zenity_after_reject > zenity_before_reject))
-[[ "$(keyring_appended_count "${rejected_keyring_before}" '^store ')" -eq 0 ]]
-[[ "$(keyring_appended_count "${rejected_keyring_before}" "^clear .*installation=${rejected_installation}")" -eq 1 ]]
+[[ ! -e "${client_rejected}/.ebonhold-login/credentials.json" ]]
 printf '%s' old-token >"${client_rejected}/.updaterToken"
 zenity_before_rejected_expiry="$(zenity_prompt_count)"
 MOCK_USER=account-b MOCK_PASSWORD=manual-pass MOCK_EXPIRE_OLD_TOKEN=true run_launcher "${client_rejected}" --status >/dev/null
@@ -447,12 +439,11 @@ if run_launcher "${client_write_fail}" --status >/dev/null 2>&1; then
 fi
 [[ -d "${client_write_fail}/.updaterToken" ]]
 
-# Read-only manual authentication never stores token/keyring state, even with inherited consent.
+# Read-only manual authentication never stores token/login state, even with inherited consent.
 client_verify="$(new_client readonly-verify)"
 printf payload >"${client_verify}/payload"
 readonly_hash="$(md5sum "${client_verify}/payload" | cut -d' ' -f1)"
 readonly_b64="$(printf '%s' "${readonly_hash}" | xxd -r -p | base64 -w0)"
-keyring_before_readonly="$(keyring_log_lines)"
 login_before_readonly="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 if remember_login=true MOCK_MANIFEST_KIND=files MOCK_HASH="${readonly_b64}" run_launcher "${client_verify}" --verify --quick >/dev/null 2>&1; then
   printf 'Verify unexpectedly succeeded with missing files.\n' >&2
@@ -461,19 +452,18 @@ fi
 login_after_readonly="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 [[ ${login_after_readonly} -gt ${login_before_readonly} ]]
 [[ ! -e "${client_verify}/.updaterToken" && ! -e "${client_verify}/Data/patch-a" ]]
-assert_no_new_keyring_mutations "${keyring_before_readonly}"
+[[ ! -e "${client_verify}/.ebonhold-login" ]]
 
 client_dry="$(new_client readonly-dry-run)"
 printf payload >"${client_dry}/payload"
 dry_hash="$(md5sum "${client_dry}/payload" | cut -d' ' -f1)"
 dry_b64="$(printf '%s' "${dry_hash}" | xxd -r -p | base64 -w0)"
-keyring_before_dry="$(keyring_log_lines)"
 login_before_dry="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 remember_login=true MOCK_MANIFEST_KIND=files MOCK_HASH="${dry_b64}" run_launcher "${client_dry}" --dry-run --quick >/dev/null
 login_after_dry="$(grep -c '/api/auth/login' "${state_dir}/curl.log" || true)"
 [[ ${login_after_dry} -gt ${login_before_dry} ]]
 [[ ! -e "${client_dry}/.updaterToken" && ! -e "${client_dry}/Data/patch-a" ]]
-assert_no_new_keyring_mutations "${keyring_before_dry}"
+[[ ! -e "${client_dry}/.ebonhold-login" ]]
 
 # Parallel 401s are renewed once by the parent; workers never prompt or race token writes.
 client_parallel="$(new_client parallel-reauth)"
@@ -523,16 +513,14 @@ MOCK_EXPIRE_OLD_TOKEN=true run_launcher "${client_relogin}" --status >/dev/null
 
 # Terminal Remember me defaults to No.
 client_terminal="$(new_client terminal-default-no)"
-terminal_before="$(keyring_log_lines)"
 terminal_output="$(printf 'terminal-user\nterminal-pass\n\n' |
-  XDG_RUNTIME_DIR="${runtime_dir}" XDG_SESSION_TYPE= GUI=false PATH="${mock_bin}:${PATH}" \
-    MOCK_KEYRING_DIR="${state_dir}/keyring" KEYRING_LOG="${state_dir}/keyring.log" \
+  XDG_RUNTIME_DIR="${runtime_dir}" XDG_SESSION_TYPE='' GUI=false PATH="${mock_bin}:${PATH}" \
+    KEYRING_LOG="${state_dir}/keyring.log" \
     ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" \
     script -q -e -c "${client_terminal}/launcher.sh --status" /dev/null 2>&1)"
 [[ "${terminal_output}" == *"[y/N]"* ]]
 [[ "$(<"${client_terminal}/.updaterToken")" == "new-token" ]]
-[[ "$(keyring_appended_count "${terminal_before}" '^store ')" -eq 0 ]]
-[[ "$(keyring_appended_count "${terminal_before}" '^clear ')" -eq 1 ]]
+[[ ! -e "${client_terminal}/.ebonhold-login" ]]
 
 # A symlink or FIFO lock fixture is rejected without truncation or blocking.
 client_lock="$(new_client lock-fixture)"
@@ -552,7 +540,7 @@ rm -f "${lock_file}"
 mkfifo "${lock_file}"
 set +e
 timeout 10 env XDG_RUNTIME_DIR="${runtime_dir}" XDG_SESSION_TYPE=x11 GUI=true PATH="${mock_bin}:${PATH}" \
-  MOCK_KEYRING_DIR="${state_dir}/keyring" KEYRING_LOG="${state_dir}/keyring.log" \
+  KEYRING_LOG="${state_dir}/keyring.log" \
   ZENITY_LOG="${state_dir}/zenity.log" CURL_ARG_LOG="${state_dir}/curl.log" \
   "${client_lock}/launcher.sh" --status >/dev/null 2>&1
 fifo_rc=$?
@@ -634,7 +622,7 @@ set -e
 [[ ${forget_rc} -eq 0 ]]
 [[ ! -e "${client_concurrent}/.updaterToken" ]]
 
-# Forget is local-only, scoped by installation, and reports keyring-clear failure accurately.
+# Forget is local-only, scoped by installation, and reports file-clear failure accurately.
 client_forget="$(new_client forget)"
 client_other="$(new_client other-installation)"
 seed_saved_client "${client_forget}"
@@ -648,13 +636,15 @@ printf '%s' old-token >"${client_other}/.updaterToken"
 other_zenity_before="$(zenity_prompt_count)"
 MOCK_EXPIRE_OLD_TOKEN=true run_launcher "${client_other}" --status >/dev/null
 [[ "$(zenity_prompt_count)" -eq "${other_zenity_before}" ]]
+[[ ! -e "${client_forget}/.ebonhold-login/credentials.json" ]]
 printf token >"${client_forget}/.updaterToken"
-if MOCK_KEYRING_CLEAR_FAIL=true run_launcher "${client_forget}" --forget-login >"${state_dir}/forget-fail.out" 2>&1; then
-  printf 'Keyring clear failure unexpectedly succeeded.\n' >&2
+mkdir "${client_forget}/.ebonhold-login/credentials.json"
+if run_launcher "${client_forget}" --forget-login >"${state_dir}/forget-fail.out" 2>&1; then
+  printf 'Credential clear failure unexpectedly succeeded.\n' >&2
   exit 1
 fi
 [[ ! -e "${client_forget}/.updaterToken" ]]
-grep -q 'Could not clear desktop-keyring credentials' "${state_dir}/forget-fail.out"
+grep -q 'Could not clear saved local credentials' "${state_dir}/forget-fail.out"
 
 # The debug stream and curl argv log never contain password or bearer-token values.
 client_debug="$(new_client debug-secrets)"
@@ -662,4 +652,5 @@ debug_output="$(MOCK_REMEMBER=false run_launcher "${client_debug}" --debug --sta
 ! grep -q 'manual-pass\|new-token\|saved-pass' <<<"${debug_output}"
 ! grep -q 'manual-pass\|new-token\|saved-pass' "${state_dir}/curl.log"
 
-printf 'login/keyring mocked tests passed\n'
+[[ ! -s "${state_dir}/keyring.log" ]]
+printf 'login/storage mocked tests passed\n'
