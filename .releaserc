@@ -7,9 +7,14 @@
       "path": "@semantic-release/github",
       "assets": [
         {
-          "path": "launcher.sh",
-          "name": "launcher.sh",
-          "label": "Ebonhold Linux launcher"
+          "path": "dist/ebonhold-launcher-linux-amd64.tar.gz",
+          "name": "ebonhold-launcher-linux-amd64.tar.gz",
+          "label": "Ebonhold Launcher (Linux x86_64)"
+        },
+        {
+          "path": "dist/ebonhold-launcher-linux-amd64.tar.gz.sha256",
+          "name": "ebonhold-launcher-linux-amd64.tar.gz.sha256",
+          "label": "SHA-256 checksum"
         }
       ]
     }
