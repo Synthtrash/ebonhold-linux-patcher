@@ -50,12 +50,12 @@ func TestPreferencesSaveRefusesSymlinkTarget(t *testing.T) {
 func TestManagerPresetsIncludeClientDirectoryAndQuotePaths(t *testing.T) {
 	launcherPath := "/home/player/Studio's launcher/ebonhold"
 	clientRoot := "/home/player/Games/Ebonhold Client"
-	steam := ManagerPreset("steam", launcherPath, clientRoot)
-	if !strings.Contains(steam, shellQuote(launcherPath)+" --client-dir="+shellQuote(clientRoot)) || !strings.HasSuffix(steam, "-- %command%") {
+	steam := ManagerPreset("steam", launcherPath, clientRoot, "roguelike")
+	if !strings.Contains(steam, shellQuote(launcherPath)+" --client-dir="+shellQuote(clientRoot)+" --game='roguelike'") || !strings.HasSuffix(steam, "-- %command%") {
 		t.Fatalf("Steam preset does not safely target the client folder: %q", steam)
 	}
-	bottles := ManagerPreset("bottles-flatpak", launcherPath, clientRoot)
-	if !strings.Contains(bottles, "--client-dir="+shellQuote(clientRoot)) || !strings.Contains(bottles, "REPLACE_WITH_BOTTLE_NAME") {
+	bottles := ManagerPreset("bottles-flatpak", launcherPath, clientRoot, "roguelike")
+	if !strings.Contains(bottles, "--client-dir="+shellQuote(clientRoot)) || !strings.Contains(bottles, "--game='roguelike'") || !strings.Contains(bottles, "REPLACE_WITH_BOTTLE_NAME") {
 		t.Fatalf("Bottles preset is incomplete: %q", bottles)
 	}
 }

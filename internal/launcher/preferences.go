@@ -170,11 +170,11 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
-func ManagerPreset(manager, launcherPath, clientRoot string) string {
+func ManagerPreset(manager, launcherPath, clientRoot, gameSlug string) string {
 	if clientRoot == "" {
 		return "Choose a client folder before applying this preset."
 	}
-	prefix := shellQuote(launcherPath) + " --client-dir=" + shellQuote(clientRoot) + " --quick --quiet"
+	prefix := shellQuote(launcherPath) + " --client-dir=" + shellQuote(clientRoot) + " --game=" + shellQuote(gameSlug) + " --quick --quiet"
 	switch manager {
 	case "steam":
 		return prefix + " -- %command%"

@@ -175,16 +175,15 @@ func authLockPath(root string) (string, error) {
 	if info, err := os.Lstat(parent); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("authentication lock parent is unsafe")
 	}
-	if info, err := os.Lstat(base); err == nil {
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || info.Mode().Perm()&0022 != 0 {
-			return "", errors.New("authentication lock directory is unsafe")
-		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(base, 0700); err != nil {
-			return "", errors.New("could not prepare authentication lock directory")
-		}
-	} else {
+	if err := os.Mkdir(base, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", errors.New("could not prepare authentication lock directory")
+	}
+	info, err := os.Lstat(base)
+	if err != nil {
 		return "", errors.New("could not inspect authentication lock directory")
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || info.Mode().Perm()&0022 != 0 {
+		return "", errors.New("authentication lock directory is unsafe")
 	}
 	return filepath.Join(base, "auth-"+hex.EncodeToString(h[:])+".lock"), nil
 }

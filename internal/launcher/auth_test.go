@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -258,5 +259,30 @@ func TestRememberWithUnsafeClientFolderWarnsAndKeepsSession(t *testing.T) {
 	}
 	if _, err := os.Lstat(store.tokenPath()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unsafe client folder received a token: %v", err)
+	}
+}
+func TestAuthLockPathConcurrentInitialization(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	root := t.TempDir()
+	const callers = 32
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := authLockPath(root)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

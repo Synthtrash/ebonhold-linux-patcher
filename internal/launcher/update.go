@@ -67,6 +67,13 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	if opts.Verify {
 		return u.verify(ctx, files, result, progress)
 	}
+	if !opts.DryRun {
+		unlock, err := acquireFileLock(filepath.Join(u.root, ".launcher-update.lock"))
+		if err != nil {
+			return result, fmt.Errorf("could not lock installation: %w", err)
+		}
+		defer unlock()
+	}
 
 	needed := make([]ManifestFile, 0, len(files))
 	for _, f := range files {
@@ -102,11 +109,6 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	if opts.DryRun {
 		return result, nil
 	}
-	unlock, err := acquireFileLock(filepath.Join(u.root, ".launcher-update.lock"))
-	if err != nil {
-		return result, fmt.Errorf("could not lock installation: %w", err)
-	}
-	defer unlock()
 
 	changed := false
 	failed, newToken := u.downloadFiles(ctx, needed, result.Token, progress)
@@ -512,16 +514,16 @@ func (u *Updater) clearCache() error {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if strings.EqualFold(filepath.Ext(entry.Name()), ".wdb") && entry.Type().IsRegular() {
-			if err := os.Remove(filepath.Join(path, entry.Name())); err != nil {
-				return err
-			}
+	if err := filepath.WalkDir(path, func(cachePath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".wdb") {
+			return nil
+		}
+		return os.Remove(cachePath)
+	}); err != nil {
+		return err
 	}
 	invalid, err := u.destination("Cache/invalid", true)
 	if err != nil {

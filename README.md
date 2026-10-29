@@ -28,10 +28,10 @@ The launcher does not edit manager settings, install packages, change sandbox pe
 
 - **Home:** choose a client folder and game profile; update, verify, or open setup.
 - **Update:** run updates or read-only verification. **View files** opens the affected file list. Technical failure details appear in a copyable dialog.
-- **Setup:** detect installed managers and show/copy a Steam, Lutris, Bottles-native, or Bottles-Flatpak preset. Presets include the selected client folder, so the launcher binary can live elsewhere.
+- **Setup:** detect installed managers and show/copy a Steam, Lutris, Bottles-native, or Bottles-Flatpak preset. Presets include the selected client folder and game profile, so the launcher binary can live elsewhere.
 - **Add-ons:** load the official catalog, check installed folders, install selected add-ons, and move launcher-managed add-ons to a reversible backup when removing them.
 
-The UI writes preferences to `$XDG_CONFIG_HOME/ebonhold-launcher/config.json` (normally `~/.config/ebonhold-launcher/config.json`). It stores the selected client folder and manager choice, not passwords.
+The UI writes preferences to `$XDG_CONFIG_HOME/ebonhold-launcher/config.json` (normally `~/.config/ebonhold-launcher/config.json`). It stores the selected client folder, game profile, and manager choice, not passwords.
 
 ## Command line
 
@@ -74,18 +74,18 @@ The launcher refreshes an expired session at most once during a download run. Do
 
 ## Manager presets
 
-Presets are generated for the selected client folder. If configuring a manager manually:
+Presets are generated for the selected client folder and game profile. The manual examples below use Production; replace `--game='roguelike-prod'` with `--game='roguelike'` for PTR.
 
 **Steam — non-Steam game Launch Options**
 
 ```sh
-'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quick --quiet -- %command%
+'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --game='roguelike-prod' --quick --quiet -- %command%
 ```
 
 **Lutris — System options → Command prefix**
 
 ```sh
-'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quick --quiet --
+'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --game='roguelike-prod' --quick --quiet --
 ```
 
 Keep Lutris's normal executable and working directory pointed at the game. The launcher passes Lutris's command through after updating.
@@ -94,7 +94,7 @@ Keep Lutris's normal executable and working directory pointed at the game. The l
 
 ```sh
 #!/bin/sh
-exec '/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quick --quiet -- \
+exec '/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --game='roguelike-prod' --quick --quiet -- \
   flatpak run --command=bottles-cli com.usebottles.bottles run \
   -b 'REPLACE_WITH_BOTTLE_NAME' -e '/path/to/Wow.exe'
 ```

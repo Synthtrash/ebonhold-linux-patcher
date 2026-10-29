@@ -281,6 +281,13 @@ func TestUpdaterRealmlistAndCacheAfterSuccess(t *testing.T) {
 	root, u := setupUpdater(t, api)
 	mustWrite(t, filepath.Join(root, "Cache/a.wdb"), []byte("db"))
 	mustWrite(t, filepath.Join(root, "Cache/keep.txt"), []byte("keep"))
+	mustWrite(t, filepath.Join(root, "Cache/WDB/enUS/old.wdb"), []byte("nested"))
+	mustWrite(t, filepath.Join(root, "Cache/WDB/enUS/keep.txt"), []byte("keep"))
+	outside := t.TempDir()
+	mustWrite(t, filepath.Join(outside, "linked.wdb"), []byte("outside"))
+	if err := os.Symlink(outside, filepath.Join(root, "Cache/external")); err != nil {
+		t.Fatal(err)
+	}
 	res, err := u.Run(context.Background(), manifest(nil, game(file("1", "Data/file", data, nil))), "", UpdateOptions{GameSlug: "retail"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -300,5 +307,14 @@ func TestUpdaterRealmlistAndCacheAfterSuccess(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "Cache/keep.txt")); err != nil {
 		t.Fatal("non-wdb cache removed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "Cache/WDB/enUS/old.wdb")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("nested wdb was not cleared")
+	}
+	if _, err := os.Stat(filepath.Join(root, "Cache/WDB/enUS/keep.txt")); err != nil {
+		t.Fatal("non-wdb file in nested cache was removed")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "linked.wdb")); err != nil {
+		t.Fatal("cache cleanup followed a symlink")
 	}
 }

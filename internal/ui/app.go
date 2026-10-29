@@ -176,6 +176,9 @@ func Run(api launcher.API, launcherRoot string) error {
 		}
 		mu.Unlock()
 		save()
+		if refreshSetup != nil {
+			refreshSetup()
+		}
 	}
 	status = widget.NewLabel("Ready · sign in to check server status")
 	status.Wrapping = fyne.TextWrapWord
@@ -463,7 +466,7 @@ func Run(api launcher.API, launcherRoot string) error {
 			if err != nil {
 				preset.SetText(err.Error())
 			} else {
-				preset.SetText(launcher.ManagerPreset(key, launcherPath, rootPath))
+				preset.SetText(launcher.ManagerPreset(key, launcherPath, rootPath, selectedGame()))
 			}
 		}
 		message := detectedManagerText + " This only detects installed applications; it cannot identify which one starts Ebonhold."
@@ -507,7 +510,7 @@ func Run(api launcher.API, launcherRoot string) error {
 			showErr("Choose a client folder", err)
 			return
 		}
-		w.Clipboard().SetContent(launcher.ManagerPreset(manager, launcherPath, rootPath))
+		w.Clipboard().SetContent(launcher.ManagerPreset(manager, launcherPath, rootPath, selectedGame()))
 		status.SetText("Preset copied · apply it yourself in the selected manager")
 	})
 	setup := container.NewVBox(widget.NewLabel("Manager setup · instructions only"), managerInfo, widget.NewLabel("Selected manager"), managerSelect, preset, copyPreset, widget.NewLabel("Do not paste a Bottles preset without replacing its bottle name and executable path. The launcher never changes manager configuration, installs packages, alters sandbox permissions, or starts the game."))
