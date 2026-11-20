@@ -1,2 +1,12 @@
 .updaterToken
+.ebonhold-token-*
 .ebonhold-login/
+/.launcher-update.lock
+/Interface/AddOns/.ebonhold-launcher.lock
+/Interface/AddOns/.ebonhold-launcher-addons.json
+/.ebonhold-removed-addons/
+/dist/
+
+# Local tool state
+/.atuin/
+/.pi/tasks/

@@ -1,130 +1,149 @@
-# ebonhold-linux-launcher
+# Ebonhold Linux Launcher
 
-Updates and launches the Project Ebonhold game client on Linux.
+Update and play Project Ebonhold on Linux. You need an existing copy of the game. If you don't have one yet, start with the [Ebonhold Installation Guide](https://project-ebonhold.com/support/installation-guide).
 
----
+## Download
 
-## What it does
+Get a [v2 release](https://github.com/synthtrash/ebonhold-linux-patcher/releases) for a 64-bit Intel or AMD PC:
 
-- Logs in via the Ebonhold API and caches your session token. Login remains interactive by default; an optional, explicit **Remember me on this computer** choice stores your username and password locally in a private file so expired tokens can be renewed without a desktop wallet.
-- Checks all required common and game files against the manifest using MD5 hashes by default.
-- Downloads missing or mismatched files (4 concurrent downloads), verifies them, then replaces files atomically. Use `--full` to include optional files.
-- Removes stale files that differ only by case from the manifest path (e.g. a leftover `patch-4.mpq` next to `patch-4.MPQ`), which would otherwise shadow the updated file on case-sensitive filesystems.
-- Checks server status and updates `Data/enUS/realmlist.wtf`.
-- After a successful file update, clears cached `.wdb` files and creates `Cache/invalid` so the game rebuilds its cache.
-- Removing addons (`--remove-addons`) moves their folders to `.ebonhold-removed-addons/` instead of deleting them, so a removal can be undone by moving the folders back.
+| If you use | Download |
+| --- | --- |
+| X11, or Wayland with XWayland | `ebonhold-launcher-linux-amd64.tar.gz` |
+| Wayland without XWayland | `ebonhold-launcher-linux-amd64-wayland.tar.gz` |
 
----
+Both downloads are built on Ubuntu 22.04. They need glibc, OpenGL, and the libraries for your display system.
 
-## Prerequisites
+Extract the archive somewhere you plan to keep it. Open the launcher inside, or run it from a terminal. If the first download won't open on Wayland, try the `-wayland` version.
 
-- **curl**, **jq**, **md5sum**, **sha256sum**, **bc**, **unzip** (including `zipinfo`), **flock** (from `util-linux`) – usually pre-installed on most Linux systems.
-- Standard GNU command-line tools such as `realpath`, `find`, `sed`, `grep`, `sort`, `date`, `stat`, and `mktemp`.
-- **zenity** (optional) – for GUI prompts; falls back to terminal prompts if missing. Once a token is cached, non-interactive launches can run without either one; the first login still needs a terminal or display.
+Optional: check the archive with `sha256sum -c` followed by the name of its matching `.sha256` file. Keep both files in the same folder.
 
----
+## Upgrade from 1.x
 
-## Usage
+[Download and extract the new launcher](#download). Keep your game folder, bottle, and shortcuts. You don't need to reinstall the game.
 
-Copy the launcher to your Ebonhold client directory and make it executable. It always updates the directory containing the invoked script or symlink, regardless of the current working directory:
+- **Play from the new launcher.** If your existing Steam or Lutris shortcut uses `launcher.sh`, remove the old updater command from the shortcut. Keep it pointing at `Wow.exe`, then follow [first setup](#first-setup).
+- **Keep starting from Steam, Lutris, or Bottles.** If your shortcut runs `launcher.sh`, [replace the old launch command](#manager-presets). You can skip desktop setup.
+- **Update a script.** Download and extract a release archive instead of downloading `launcher.sh`, then use the [update-only command](#command-line).
 
-```bash
-chmod +x launcher.sh
-./launcher.sh
-./launcher.sh --debug
+## First setup
+
+1. Open **Setup**. If you need the game files, choose **I need to install it**. If you already have Ebonhold, let the launcher look for it, or choose `Wow.exe` or the folder containing it and `Data/`. Use a separate folder for each profile.
+2. Under **How to launch**, choose the app you already use. Pick your existing Bottles bottle or a matching Steam or Lutris shortcut. If there is one matching shortcut, the launcher suggests it. Use **Advanced** only if you need to enter an ID. If you only want the updater, choose **Start the game myself**.
+3. On **Next steps**, use **Test launch** to see whether the game opens without a launcher update. Then use **Play** on Home. If you chose **Start the game myself**, update here and start the game from your usual app.
+
+Drag the title bar to move the folder or file picker inside the launcher. On small displays, the launcher uses smaller text without changing your desktop settings. If Home is narrow, scroll past the controls to see the news. Setup keeps its buttons visible while you scroll.
+
+Steam needs a non-Steam shortcut pointing to that folder's `Wow.exe`. The launcher won't edit your Steam, Lutris, or Bottles settings. If you move the game, choose its launch target again in **Setup**.
+
+If you create a separate copy in Setup, **Check space** shows the destination, estimated copy size, and free space before copying. An activity bar stays visible while the launcher checks space or copies files. Keep the launcher open until the copy is ready, then use the install button on Home before playing it.
+
+If you move or delete a test copy, reopen **Setup** on that profile. **Create PTR copy** offers the previous path if it is free, or you can choose an existing folder.
+
+## Using the launcher
+
+- **Play** skips the desktop launcher's update check by default. Use a Steam or Lutris shortcut without an updater command if you want Play to start the game without checking. **Update files** downloads changes. **Verify files** checks the game files without changing them. Both buttons need your Ebonhold sign-in.
+- If an update fails, select a file in **Update** to see why. **Technical details** lists all failures in one place. Use **Copy details** if you need to share them.
+- Run `--version` to identify the build when reporting a problem. **Copy details** includes the same version.
+- **Add-ons** shows what you can install or update. Removal only affects add-ons installed by this launcher and moves them to a backup.
+- **News** shows the latest posts from Project Ebonhold. No sign-in needed.
+- **Player Guide** under **Latest news** on Home opens the gameplay guide in your browser.
+- In **Settings**, you can make **Play** check for updates first, choose the launcher language, or pick game language and HD patches for the next update. Enter Bottles launch arguments one per line, without quotes. Set Steam or Lutris launch arguments in those apps.
+- **Settings → Launch → Add to Applications** puts Ebonhold Linux Launcher in your app menu without `sudo`. If you move the executable, run it from its new location and add the shortcut again.
+
+## When the game won't open
+
+Open **Troubleshoot** on Home or in Setup. Start by trying the same `Wow.exe` in your usual game app. The launcher can point you to Steam compatibility settings, Flatpak folder access, Microsoft Visual C++ downloads, or display fixes. It won't install a runtime or change Flatpak permissions.
+
+If a launch fails, **Copy details** shares the launcher version, Linux distribution, display session, game app, and detected issue when available. It excludes paths, credentials, and raw launch output. Use **View local output** to inspect the full captured message and check it for private information before sharing.
+
+If the game opens but has black bars or clicks land in the wrong place, close WoW. Open **Settings → Launch → Game CVars**, select **Load windowed preset**, and choose **Apply**. This changes the game's display settings, not how Wine connects to your desktop. To undo it, close WoW and restore `WTF/Config.wtf.before-launcher-cvars` as `WTF/Config.wtf`.
+
+To use your own wallpaper, put `background.jpg` in `~/.config/ebonhold-launcher/` next to `config.json` and restart. If you set `XDG_CONFIG_HOME`, use the `ebonhold-launcher` folder there instead. Move the JPEG aside to restore the built-in wallpaper.
+
+## Command line
+
+To update without opening the launcher window, pass `--client-dir`, even if the executable is already in your game folder. Use the `-wayland` executable name if that's the version you downloaded.
+
+```sh
+./ebonhold-launcher-linux-amd64 --client-dir="$HOME/Games/Ebonhold"
+./ebonhold-launcher-linux-amd64 --client-dir="$HOME/Games/Ebonhold" --dry-run
+./ebonhold-launcher-linux-amd64 --client-dir="$HOME/Games/Ebonhold" --verify
+./ebonhold-launcher-linux-amd64 --client-dir="$HOME/Games/Ebonhold" --status
 ```
 
-### Flags
+Run `--help` to see all options. `--dry-run` lists what an update would download. `--verify` checks the files you already have. Neither changes your game files or saves a login.
 
-| Flag | Description |
-| ------ | ------------- |
-| `--debug` | Enable verbose output |
-| `--verify` | Check files against the manifest without changing client files, cache, realmlist, token, or addons |
-| `--dry-run` | Show downloads that would be needed without changing client files, cache, realmlist, or token |
-| `--quick` | Check only required game patch files, matching the previous default behavior |
-| `--full` | Check and update all common and game files, including optional files |
-| `--status` | Show the authenticated realm status and exit |
-| `--game=SLUG` | Select a game from the launcher manifest (default: `roguelike-prod`) |
-| `--list-addons` | List addons available from the official launcher catalog |
-| `--check-addons` | Check installed launcher addons and suggest available updates |
-| `--select-addons` | Interactively select addons to download |
-| `--remove-addons` | Interactively select installed launcher addons to remove |
-| `--remove-addons=LIST` | Remove comma-separated installed addon names or IDs |
-| `--addons=LIST` | Download comma-separated addon names or IDs, such as `--addons=Elvui,Details` |
-| `--quiet` | Suppress routine output; warnings and errors remain |
-| `--relogin` | Ignore cached/saved login and request a fresh manual login; choose Remember me again if desired |
-| `--forget-login` | Remove this installation's cached token and saved local login without contacting the network |
-| `--help` | Show this message |
+Without `--game`, the updater uses the default profile, regardless of the game folder. Use `--game=roguelike` for a folder set up under the other profile. If your old command used `--game=NAME` or your old script set `game=NAME`, pass the same `--game=NAME` to the new launcher.
 
-When run interactively without game arguments, the launcher checks installed addons after updating and offers to install available updates. Steam and other passthrough launches never prompt for addons. Arguments after the launcher options are passed to the game; use `--` when you want to clearly separate them from launcher options. Use `--game=roguelike` for the PTR manifest.
+## Manager presets
 
-### Login and local storage
+Use these commands to update automatically when starting the game from your usual app. If you selected a launch target in Setup, copy your command from **Setup → Next steps → Advanced**. Otherwise, use the examples below. For a shortcut that uses a different game profile, add [`--game=NAME`](#command-line) after `--client-dir=…` and before the first `--`.
 
-A valid `.updaterToken` is always reused without reading a password. If it is missing or expired, an opted-in saved login is tried once; rejected saved credentials are never retried in a loop. Otherwise the launcher asks for a normal username and password. In a GUI, the Remember me choice is an unchecked checklist; in a terminal it defaults to **No**. Credentials are written only after authentication succeeds and consent is explicit.
+If a shortcut needs you to sign in again, the updater uses Zenity to show the sign-in prompt. Without Zenity, run an update in a terminal first with the same `--client-dir` and `--game` settings, then try the shortcut again.
 
-Remember me stores **unencrypted** username/password JSON at `.ebonhold-login/credentials.json` beside the launcher. The directory is created with mode `0700` and the file is atomically written with mode `0600`. The launcher refuses unsafe ownership/permissions and symlinked credential paths; the client directory must be owned by you and not writable by other users. **Programs running as you, root, and backups can still read the password.** Enable this only on a trusted computer; don't share or sync the credential file. No desktop wallet or `secret-tool` is needed.
+**Steam:** Replace the old updater command in **Launch Options**. Keep your game arguments after `%command%`.
 
-Use `--relogin` to force a new manual login and choose the setting again. Opting out after a successful manual login removes the previous saved local login. Use `--forget-login` to clear this installation's cached token and saved local credentials without network access; removal failures are reported. `--verify` and `--dry-run` can use saved credentials but do not write tokens, credentials, or client files.
-
-**Upgrading from the keyring version:** run `./launcher.sh --relogin --status` and select Remember me once. Old wallet entries are neither imported nor accessed or deleted. You can remove the old “Ebonhold Updater” entries in your wallet manager, or, with the wallet unlocked, run:
-
-```bash
-secret-tool clear service com.project-ebonhold.updater installation "$(realpath /path/to/client)"
+```sh
+'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quiet -- %command%
 ```
 
-The launcher never logs the password or raw login response, does not pass bearer tokens or passwords as curl command-line arguments, and does not pass updater credentials to the game process. A headless first login fails with an actionable message unless a saved local login can be used.
+With Flatpak Steam, put the launcher somewhere Steam can read. Steam also needs read and write access to the game folder to run the updater, even when no update is available. If Steam has read-only access, keep the original shortcut without the updater command and run updates outside Steam.
 
-### Steam (non-Steam game)
+**Lutris:** Paste into **System options → Command prefix**.
 
-1. Add `Wow.exe` as a non-Steam game in Steam.
-2. Right-click the game → Properties → Launch Options:
-
-```bash
-/path/to/launcher.sh --quick --quiet -- %command%
+```sh
+'/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quiet --
 ```
 
-The launcher quickly checks game patch files, then launches the game. Omit `--quick` to check every required file. If files changed, it clears `.wdb` cache files and creates `Cache/invalid` before launch. If your cached token expires, saved local credentials renew the updater login without prompting. Without a saved login, a zenity login prompt will pop up.
+Leave the executable, working directory, and game arguments in the game's settings.
 
-### Lutris
+**Bottles:** Save this as `launch-ebonhold.sh`. Change `Ebonhold` after `--bottle` to your bottle's name.
 
-Lutris can prepend a command to its normal Wine launch command:
-
-1. Open the game's **Configure** window.
-2. Open **System options**.
-3. Set **Command prefix** to the launcher command, using an absolute path:
-
-```bash
-/path/to/launcher.sh --quick --quiet --
-```
-
-Leave the Lutris executable and working directory set to the game client. Lutris will run the launcher first; the launcher updates the client and then passes Lutris's normal Wine command through unchanged. Remove `--quiet` while testing if you want to see the update messages.
-
-### Bottles
-
-Bottles does not use Steam's `%command%` placeholder. The simplest setup is a small wrapper that runs the launcher and then Bottles' CLI:
-
-```bash
-#!/usr/bin/env bash
-exec /path/to/launcher.sh --quick --quiet -- \
+```sh
+#!/bin/sh
+exec '/path/to/ebonhold-launcher' --client-dir='/path/to/Ebonhold' --quiet -- \
   flatpak run --command=bottles-cli com.usebottles.bottles run \
-  -b "MyBottle" -e "/path/to/Wow.exe"
+  --bottle='Ebonhold' -e '/path/to/Ebonhold/Wow.exe'
 ```
 
-Save it as `launch-ebonhold.sh`, replace `MyBottle` and the executable path, then run:
+Keep any game arguments after a second `--`, following the `Wow.exe` path. If you installed Bottles outside Flatpak, use `bottles-cli` instead of `flatpak run --command=bottles-cli com.usebottles.bottles`. Run `chmod +x launch-ebonhold.sh` before using the script.
 
-```bash
-chmod +x launch-ebonhold.sh
-./launch-ebonhold.sh
+## Sign-in and local files
+
+Launcher sign-in is for updates and add-ons. The launcher saves a session token in `.updaterToken`, not your password. WoW has its own login screen, so sign in there separately. If the launcher token expires, sign in to the launcher again.
+
+To save only your account name, select **Remember Account Name** in WoW. Anyone who can read the game folder can see the name, so leave it off on shared computers. To clear the name, uncheck it and sign in to WoW again.
+
+The desktop launcher removes old `.ebonhold-login/credentials.json` files from valid saved game folders and when you confirm a folder in Setup. It warns if it can't check a saved folder or safely remove an old password. The command line checks for the file before reusing your token, including when reporting status or add-ons. Verify and dry-run leave it alone.
+
+To sign out locally, run the launcher with `--client-dir` and `--forget-login`. This removes the cached session and any old saved password file without contacting the server. The launcher does not read or remove entries in your desktop password wallet.
+
+If cleanup fails, check that `.ebonhold-login` and `credentials.json` are inside the intended game folder and neither is a symlink before removing the old file manually. `--forget-login` reports paths it can't safely clean up.
+
+## Build from source
+
+Builds need Go 1.26.11 or newer, CGO, and OpenGL development libraries. On Debian or Ubuntu, install `libgl1-mesa-dev`, `xorg-dev`, `pkg-config`, `libwayland-dev`, and `libxkbcommon-dev` to build both versions.
+
+```sh
+go test -tags no_emoji ./...
+go test -tags no_emoji,wayland ./...
+./scripts/package-linux.sh dist
 ```
 
-For a non-Flatpak Bottles installation, replace the `flatpak run --command=bottles-cli com.usebottles.bottles` portion with `bottles-cli`. The launcher updates the client directory before invoking Bottles. Do not add the shell script as a Windows executable inside the bottle; it is a Linux launcher command.
+Pass a version as the second argument to label both archives, for example `./scripts/package-linux.sh dist v2.0.0-rc.1`.
 
-### Independent optional password-prefill modification
+The release workflow packages both versions on Ubuntu 22.04. Building on a newer distro can produce executables that won't run on older systems.
 
-The launcher does not implement game autologin, GlueXML/savepass installation, password downloading, or saved-game-password import. If you independently choose to investigate password prefilling, [wow-wotlk_savepass](https://github.com/s0h2x/wow-wotlk_savepass) is an **OPTIONAL, independent modification** and is untested on Ebonhold. It may store credentials recoverably on disk; review its code and storage behavior yourself. No compatibility claim is made here.
+The launcher is [MIT licensed](LICENSE). The release archives include third-party notices.
 
----
+### Check the profile isolation proof
 
-## Credits
+[Lean 4](https://lean-lang.org/install/manual/) checks a model of the game folders: switching profiles leaves both folders intact, and folder edits cannot make them overlap. The Go test checks the launcher's folder selection and validation against cases generated by the model. It does not prove the Go code or model filesystem aliases such as symlinks.
 
-Fork of [sigboe/ebonhold-updater](https://github.com/sigboe/ebonhold-updater) by **Sigboe**.
+Use Lean on `PATH` with the version pinned in `internal/launcher/testdata/proofs/lean-toolchain`. If you use Elan, install that toolchain first. Then run:
+
+```sh
+go test -tags leanproof ./internal/launcher -run '^TestProfileIsolationProof$' -count=1 -v
+```
+
+Go CI runs this check on pull requests and pushes to `main`. Lean is not needed to build or run the launcher.

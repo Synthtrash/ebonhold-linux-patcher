@@ -1,0 +1,40 @@
+name: Create Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Fyne and GLFW build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev pkg-config libwayland-dev libxkbcommon-dev
+
+      - run: go test -tags no_emoji ./...
+      - run: go test -tags no_emoji,wayland ./...
+      - run: go vet -tags no_emoji ./...
+      - run: go vet -tags no_emoji,wayland ./...
+
+      - name: Build release archives
+        run: ./scripts/package-linux.sh dist
+
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
