@@ -25,5 +25,18 @@ jobs:
         run: go test -tags no_emoji,wayland ./...
       - run: go vet -tags no_emoji ./...
       - run: go vet -tags no_emoji,wayland ./...
+      - name: Check profile isolation with Lean 4
+        shell: bash
+        run: |
+          toolchain=$(<internal/launcher/testdata/proofs/lean-toolchain)
+          version=${toolchain#leanprover/lean4:v}
+          archive="lean-$version-linux.tar.zst"
+          lean_dir=$(mktemp -d)
+          trap 'rm -rf -- "$lean_dir"' EXIT
+          curl -fsSL -o "$lean_dir/$archive" "https://github.com/leanprover/lean4/releases/download/v$version/$archive"
+          # Update the upstream Linux x86_64 checksum when changing lean-toolchain.
+          printf '%s  %s\n' 2b7ab1ed8b92d2e6abfaf41344823b510064dbc9c0260cac73eb496ab2dea6eb "$lean_dir/$archive" | sha256sum -c
+          tar --zstd -xf "$lean_dir/$archive" -C "$lean_dir" --strip-components=1
+          PATH="$lean_dir/bin:$PATH" go test -tags leanproof ./internal/launcher -run '^TestProfileIsolationProof$' -count=1 -v
       - name: Package both backends (without publishing)
         run: ./scripts/package-linux.sh /tmp/linux-packages

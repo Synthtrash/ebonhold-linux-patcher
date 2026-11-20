@@ -146,4 +146,4 @@ Use Lean on `PATH` with the version pinned in `internal/launcher/testdata/proofs
 go test -tags leanproof ./internal/launcher -run '^TestProfileIsolationProof$' -count=1 -v
 ```
 
-Lean is only needed for this check, not to build or run the launcher.
+Go CI runs this check on pull requests and pushes to `main`. Lean is not needed to build or run the launcher.
