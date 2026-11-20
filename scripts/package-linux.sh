@@ -3,6 +3,18 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 dist_dir=${1:-dist}
+version=${2:-}
+if [[ -z $version ]]; then
+  if revision=$(git -C "$repo_root" rev-parse --short=12 HEAD 2>/dev/null); then
+    version="commit-$revision"
+  else
+    version=dev
+  fi
+fi
+if [[ ! $version =~ ^[a-zA-Z0-9][a-zA-Z0-9.+-]*$ ]]; then
+  printf 'Invalid launcher version: %s\n' "$version" >&2
+  exit 2
+fi
 mkdir -p -- "$dist_dir"
 dist_dir=$(cd -- "$dist_dir" && pwd)
 
@@ -10,6 +22,9 @@ cd "$repo_root"
 export CGO_ENABLED=1 GOOS=linux GOARCH=amd64
 staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
+build_tags=(no_emoji no_emoji,wayland)
+ldflags="-s -w -buildid= -X github.com/synthtrash/ebonhold-linux-patcher/internal/launcher.buildVersion=$version"
+
 notice() {
   printf '=== %s ===\n\n' "$1"
   cat -- "$2"
@@ -18,7 +33,7 @@ notice() {
 
 # Include licenses for the union of packages compiled into the two executables.
 modules=$(
-  for tags in '' wayland; do
+  for tags in "${build_tags[@]}"; do
     go list -tags "$tags" -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}{{"\t"}}{{.Dir}}{{end}}{{end}}' ./cmd/ebonhold-launcher || exit
   done | LC_ALL=C sort -u
 )
@@ -50,20 +65,17 @@ fi
       notice "$module/$file" "$dir/$file"
     done <<< "$files"
   done <<< "$modules"
-  notice 'Fyne/EmojiOneColor' scripts/licenses/EmojiOneColor.txt
 } > "$staging/THIRD-PARTY-NOTICES.txt"
 
-for backend in x11 wayland; do
+for tags in "${build_tags[@]}"; do
   suffix=
-  tags=()
-  if [[ $backend == wayland ]]; then
+  if [[ $tags == *,wayland ]]; then
     suffix=-wayland
-    tags=(-tags wayland)
   fi
 
   binary="ebonhold-launcher-linux-amd64${suffix}"
   archive="${binary}.tar.gz"
-  go build -trimpath -buildvcs=false "${tags[@]}" -ldflags='-s -w -buildid=' -o "$dist_dir/$binary" ./cmd/ebonhold-launcher
+  go build -trimpath -buildvcs=false -tags "$tags" -ldflags="$ldflags" -o "$dist_dir/$binary" ./cmd/ebonhold-launcher
   tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
     -C "$dist_dir" -cf - "$binary" -C "$repo_root" LICENSE \
     -C "$staging" THIRD-PARTY-NOTICES.txt | gzip -n > "$dist_dir/$archive"
