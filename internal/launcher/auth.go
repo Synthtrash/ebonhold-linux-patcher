@@ -231,7 +231,7 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 			if e == nil {
 				m, e := a.API.Games(ctx, token)
 				if e != nil {
-					return "", Manifest{}, errors.New("could not load manifest after saved sign-in")
+					return "", Manifest{}, fmt.Errorf("could not load manifest after saved sign-in: %w", e)
 				}
 				if !a.ReadOnly {
 					if e = a.Store.saveToken(token); e != nil {
@@ -247,6 +247,9 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 	}
 	user, pass, remember, err := a.Prompt.PromptLogin(ctx, "", !a.ReadOnly)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return "", Manifest{}, err
+		}
 		return "", Manifest{}, errors.New("could not prompt for sign-in")
 	}
 	token, err := a.API.Login(ctx, user, pass)

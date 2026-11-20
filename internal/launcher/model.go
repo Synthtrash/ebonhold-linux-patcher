@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 )
 
@@ -34,11 +35,34 @@ type Game struct {
 }
 
 type ManifestFile struct {
-	ID           string  `json:"id"`
-	Path         string  `json:"file_path_from_game_root"`
-	Hash         string  `json:"file_hash"`
-	OptionSlug   *string `json:"option_slug"`
-	FileSizeByte int64   `json:"file_size_bytes"`
+	ID         string  `json:"id"`
+	Path       string  `json:"file_path_from_game_root"`
+	Hash       string  `json:"file_hash"`
+	OptionSlug *string `json:"option_slug"`
+}
+
+func (f *ManifestFile) UnmarshalJSON(data []byte) error {
+	type plain ManifestFile
+	var decoded struct {
+		*plain
+		ID json.RawMessage `json:"id"`
+	}
+	decoded.plain = (*plain)(f)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	if len(decoded.ID) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(decoded.ID, &f.ID); err == nil {
+		return nil
+	}
+	var id json.Number
+	if err := json.Unmarshal(decoded.ID, &id); err != nil {
+		return err
+	}
+	f.ID = id.String()
+	return nil
 }
 
 type ServerStatus struct {
@@ -69,6 +93,7 @@ type Progress struct {
 	Message string
 	Path    string
 	Current int
+	Issue   string // Verification result: "missing", "mismatch", or "unreadable".
 	Total   int
 	Bytes   int64
 }
@@ -92,12 +117,29 @@ type Authenticator struct {
 }
 
 type UpdateOptions struct {
-	GameSlug string
-	Quick    bool
-	Full     bool
-	Verify   bool
-	DryRun   bool
-	Quiet    bool
+	GameSlug     string
+	Quick        bool
+	Full         bool
+	Verify       bool
+	DryRun       bool
+	Quiet        bool
+	Language     string
+	ManageHD     bool
+	HDCharacters bool
+	HDCreatures  bool
+	OptionSlugs  []string
+}
+
+type GameOption struct {
+	Slug   string
+	Kind   string
+	Locale string
+	Paths  []string
+}
+
+type FileFailure struct {
+	Path   string
+	Reason string
 }
 
 type UpdateResult struct {
@@ -109,10 +151,10 @@ type UpdateResult struct {
 	Downloaded       int
 	Missing          int
 	Mismatched       int
-	FailedPaths      []string
+	FailedFiles      []FileFailure
 	FilesUpdated     bool
 	RealmlistUpdated bool
 	PlannedPaths     []string
-	BytesBefore      int64
+	RemovedPaths     []string
 	BytesAfter       int64
 }

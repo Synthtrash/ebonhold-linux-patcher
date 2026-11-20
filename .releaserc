@@ -9,12 +9,22 @@
         {
           "path": "dist/ebonhold-launcher-linux-amd64.tar.gz",
           "name": "ebonhold-launcher-linux-amd64.tar.gz",
-          "label": "Ebonhold Launcher (Linux x86_64)"
+          "label": "Ebonhold Launcher (Linux x86_64, X11/XWayland)"
         },
         {
           "path": "dist/ebonhold-launcher-linux-amd64.tar.gz.sha256",
           "name": "ebonhold-launcher-linux-amd64.tar.gz.sha256",
-          "label": "SHA-256 checksum"
+          "label": "SHA-256 checksum (X11/XWayland)"
+        },
+        {
+          "path": "dist/ebonhold-launcher-linux-amd64-wayland.tar.gz",
+          "name": "ebonhold-launcher-linux-amd64-wayland.tar.gz",
+          "label": "Ebonhold Launcher (Linux x86_64, native Wayland)"
+        },
+        {
+          "path": "dist/ebonhold-launcher-linux-amd64-wayland.tar.gz.sha256",
+          "name": "ebonhold-launcher-linux-amd64-wayland.tar.gz.sha256",
+          "label": "SHA-256 checksum (native Wayland)"
         }
       ]
     }

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -189,18 +190,39 @@ func (a *HTTPAPI) Download(ctx context.Context, downloadURL string, dst io.Write
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, downloadURL, nil)
 	if err != nil {
-		return err
+		return errors.New("invalid download request")
 	}
 	req.Header.Set("User-Agent", userAgent)
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return errors.New("download request failed")
+		if err := requestCtx.Err(); err != nil {
+			return fmt.Errorf("download request: %w", err)
+		}
+		var network net.Error
+		if errors.As(err, &network) && network.Timeout() {
+			return errors.New("download request timed out")
+		}
+		var dns *net.DNSError
+		if errors.As(err, &dns) {
+			return errors.New("could not resolve the download server")
+		}
+		return errors.New("could not connect to the download server")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &HTTPError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("download returned HTTP %d", resp.StatusCode)}
 	}
 	if _, err := io.Copy(dst, resp.Body); err != nil {
+		if err := requestCtx.Err(); err != nil {
+			return fmt.Errorf("download stream: %w", err)
+		}
+		var file *os.PathError
+		if errors.As(err, &file) {
+			return fmt.Errorf("write temporary file: %w", file.Err)
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return errors.New("download ended before all bytes arrived")
+		}
 		return errors.New("download stream failed")
 	}
 	return nil
@@ -249,7 +271,7 @@ func (a *HTTPAPI) jsonRequest(ctx context.Context, method, path, token string, b
 		return &HTTPError{StatusCode: resp.StatusCode, Message: responseError(data, resp.StatusCode, token)}
 	}
 	if err := json.Unmarshal(data, dst); err != nil {
-		return errors.New("API returned invalid JSON")
+		return fmt.Errorf("API returned invalid JSON (HTTP %d, Content-Type %q): %w", resp.StatusCode, resp.Header.Get("Content-Type"), err)
 	}
 	return nil
 }

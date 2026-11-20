@@ -35,6 +35,10 @@ type CLIOptions struct {
 	Quiet         bool
 	Relogin       bool
 	ForgetLogin   bool
+	Language      string
+	HDCharacters  bool
+	HDCreatures   bool
+	OptionSlugs   []string
 	GameArguments []string
 }
 
@@ -94,6 +98,21 @@ func ParseArgs(args []string) (CLIOptions, error) {
 			if opts.Addons == "" {
 				return opts, errors.New("--addons requires a comma-separated list")
 			}
+		case strings.HasPrefix(arg, "--language="):
+			opts.Language = strings.TrimPrefix(arg, "--language=")
+			if opts.Language == "" {
+				return opts, errors.New("--language requires a locale code")
+			}
+		case arg == "--hd-characters":
+			opts.HDCharacters = true
+		case arg == "--hd-creatures":
+			opts.HDCreatures = true
+		case strings.HasPrefix(arg, "--option="):
+			slug := strings.TrimPrefix(arg, "--option=")
+			if slug == "" {
+				return opts, errors.New("--option requires a manifest option slug")
+			}
+			opts.OptionSlugs = append(opts.OptionSlugs, slug)
 		case arg == "--quiet":
 			opts.Quiet = true
 		case arg == "--relogin":
@@ -141,6 +160,11 @@ func validateCLIOptions(o CLIOptions) error {
 	if o.GUI && (o.Help || o.Debug || o.Verify || o.DryRun || o.Quick || o.Full || o.Status || o.GameSlug != "" || o.ClientDir != "" || o.ListAddons || o.CheckAddons || o.SelectAddons || o.RemoveAddons || o.Addons != "" || o.Quiet || o.Relogin || o.ForgetLogin || len(o.GameArguments) > 0) {
 		return errors.New("--gui must be used by itself")
 	}
+	if o.Language != "" || o.HDCharacters || o.HDCreatures || len(o.OptionSlugs) > 0 {
+		if o.Status || o.ListAddons || o.CheckAddons || o.RemoveAddons || o.ForgetLogin || o.GUI || o.Full {
+			return errors.New("game options require an update or verification without --full")
+		}
+	}
 	return nil
 }
 
@@ -152,7 +176,7 @@ Options:
   --debug           Enable verbose diagnostics
   --verify          Check manifest files without changing client files or login state
   --dry-run         Preview files that would be downloaded without changing state
-  --quick           Check required game patch files only
+  --quick           Standalone check of required game patch files (never limits an update before launch)
   --full            Include optional common and game files
   --status          Show realm status and exit
   --game=SLUG       Select a manifest game (default: roguelike-prod)
@@ -162,14 +186,17 @@ Options:
   --select-addons   Choose add-ons to install interactively
   --remove-addons   Choose launcher-managed add-ons to remove
   --remove-addons=LIST  Remove comma-separated add-on names or IDs
-  --addons=LIST     Install comma-separated add-on names or IDs
-  --quiet           Suppress routine output; warnings and errors remain
+  --language=LOCALE  Select a game language (enUS, frFR, esES, deDE)
+  --hd-characters    Enable manifest-provided character HD files
+  --hd-creatures     Enable manifest-provided creature HD files
+  --option=SLUG      Select an exact manifest option slug
+  --quiet            Suppress routine output; warnings and errors remain
   --relogin         Ignore cached login and request fresh credentials
   --forget-login    Remove this installation's token and saved login locally
   --help            Show this help
 
 Put -- before the game-manager command. Example:
-  %s --quick --quiet -- %%command%%
+  %s --quiet -- %%command%%
 `, program, program)
 }
 
@@ -321,6 +348,31 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 		return err
 	}
 
+	if opts.GameSlug == "" {
+		opts.GameSlug = "roguelike-prod"
+	}
+	var prefs Preferences
+	if !opts.Status && !opts.ListAddons && !opts.CheckAddons {
+		if prefsStore, storeErr := NewPreferencesStore(); storeErr == nil {
+			prefs, err = prefsStore.Load()
+			if err != nil {
+				return err
+			}
+			for _, saved := range [...]struct{ slug, name string }{
+				{"roguelike-prod", "Production"},
+				{"roguelike", "PTR"},
+			} {
+				if opts.GameSlug == saved.slug {
+					continue
+				}
+				roots := Preferences{ProductionRoot: root, PTRRoot: prefs.RootForProfile(saved.slug)}
+				if err := roots.ValidateRoots(); err != nil {
+					return fmt.Errorf("client folder conflicts with the saved %s folder; use --game=%s with that folder or choose a separate --client-dir: %w", saved.name, saved.slug, err)
+				}
+			}
+		}
+	}
+
 	token, manifest, err := auth.Authenticate(ctx, opts.Relogin)
 	if err != nil {
 		return err
@@ -408,7 +460,23 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 	}
 
 	updater := NewUpdater(api, auth, root)
-	result, err := updater.Run(ctx, manifest, token, UpdateOptions{GameSlug: game.Slug, Quick: opts.Quick, Full: opts.Full, Verify: opts.Verify, DryRun: opts.DryRun, Quiet: opts.Quiet}, func(progress Progress) {
+	updateOptions := UpdateOptions{GameSlug: game.Slug, Quick: opts.Quick && len(opts.GameArguments) == 0, Full: opts.Full, Verify: opts.Verify, DryRun: opts.DryRun, Quiet: opts.Quiet, Language: opts.Language, HDCharacters: opts.HDCharacters, HDCreatures: opts.HDCreatures, OptionSlugs: opts.OptionSlugs}
+	if len(opts.OptionSlugs) == 0 && !updateOptions.Quick && !opts.Full {
+		if configuredRoot := prefs.RootForProfile(game.Slug); configuredRoot != "" {
+			actual, actualErr := resolvedRoot(root)
+			configured, configuredErr := resolvedRoot(configuredRoot)
+			if actualErr == nil && configuredErr == nil && actual == configured {
+				settings := prefs.GameSettingsForProfile(game.Slug)
+				if updateOptions.Language == "" {
+					updateOptions.Language = settings.Language
+				}
+				updateOptions.ManageHD = settings.ManageHD
+				updateOptions.HDCharacters = updateOptions.HDCharacters || settings.HDCharacters
+				updateOptions.HDCreatures = updateOptions.HDCreatures || settings.HDCreatures
+			}
+		}
+	}
+	result, err := updater.Run(ctx, manifest, token, updateOptions, func(progress Progress) {
 		if opts.Quiet {
 			return
 		}
@@ -474,16 +542,13 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 			}
 		}
 	}
-	if len(opts.GameArguments) > 0 && !opts.Verify {
+	if len(opts.GameArguments) > 0 && !opts.Verify && !opts.DryRun {
 		return runGame(ctx, opts.GameArguments, console)
 	}
 	return nil
 }
 
 func selectGame(manifest Manifest, slug string) (Game, error) {
-	if slug == "" {
-		slug = "roguelike-prod"
-	}
 	for _, game := range manifest.Data.Games {
 		if game.Slug == slug {
 			return game, nil
@@ -551,16 +616,7 @@ func runGame(ctx context.Context, args []string, console *Console) error {
 	cmd.Stdin = console.In
 	cmd.Stdout = console.Out
 	cmd.Stderr = console.Err
-	cmd.Env = os.Environ()
-	if strings.Contains(strings.ToLower(strings.Join(args, " ")), "wow.exe") {
-		env := make([]string, 0, len(cmd.Env)+2)
-		for _, value := range cmd.Env {
-			if !strings.HasPrefix(value, "TZ=") {
-				env = append(env, value)
-			}
-		}
-		cmd.Env = append(env, "PROTON_FORCE_LARGE_ADDRESS_AWARE=1", "WINE_LARGE_ADDRESS_AWARE=1")
-	}
+	cmd.Env = gameEnvironment(cmd.Environ())
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

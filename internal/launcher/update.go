@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
@@ -8,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,20 +45,69 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 		return result, fmt.Errorf("game %q not found in manifest", opts.GameSlug)
 	}
 	result.Game = *game
+	var selectedOptions map[string]bool
+	var options []GameOption
+	if len(opts.OptionSlugs) > 0 || opts.ManageHD || opts.HDCharacters || opts.HDCreatures || opts.Language != "" && opts.Language != "enUS" {
+		selectedOptions = make(map[string]bool)
+		options = AvailableGameOptions(manifest, game.Slug)
+	}
+	locale := opts.Language
+	if locale != "" && locale != "enUS" && locale != "frFR" && locale != "deDE" && locale != "esES" {
+		return result, fmt.Errorf("unsupported game language %q", locale)
+	}
+	var localeRealmlist string
+	if locale != "" && locale != "enUS" {
+		localeRealmlist = filepath.Join("Data", locale, "realmlist.wtf")
+	}
+	if locale != "" && locale != "enUS" {
+		found := false
+		for _, option := range options {
+			if option.Kind == "language" && option.Locale == locale {
+				selectedOptions[option.Slug] = true
+				found = true
+			}
+		}
+		if !found {
+			if err := u.validateLocalePack(locale); err != nil {
+				return result, fmt.Errorf("language %s has no manifest pack; install it using https://project-ebonhold.com/support/installation-guide: %w", locale, err)
+			}
+		}
+	}
+	for _, option := range options {
+		if option.Kind == "hd-characters" && opts.HDCharacters || option.Kind == "hd-creatures" && opts.HDCreatures {
+			selectedOptions[option.Slug] = true
+		}
+	}
+	if opts.HDCharacters && !hasGameOption(options, "hd-characters") {
+		return result, errors.New("character HD option is not available in the manifest")
+	}
+	if opts.HDCreatures && !hasGameOption(options, "hd-creatures") {
+		return result, errors.New("creature HD option is not available in the manifest")
+	}
+	for _, slug := range opts.OptionSlugs {
+		selectedOptions[slug] = true
+	}
+	for slug := range selectedOptions {
+		found := false
+		for _, option := range options {
+			found = found || option.Slug == slug
+		}
+		if !found {
+			return result, fmt.Errorf("game option %q not found in manifest", slug)
+		}
+	}
 	files := make([]ManifestFile, 0, len(manifest.Data.Common.Files)+len(game.Files))
 	appendSet := func(entries []ManifestFile, common bool) {
 		for _, f := range entries {
-			if strings.EqualFold(filepath.ToSlash(f.Path), "Data/enUS/realmlist.wtf") {
+			if strings.EqualFold(f.Path, "Data/enUS/realmlist.wtf") || localeRealmlist != "" && strings.EqualFold(f.Path, localeRealmlist) {
 				continue
 			}
-			if opts.Full || (opts.Quick && !common && f.OptionSlug == nil && patchPath(f.Path)) || (!opts.Full && !opts.Quick && f.OptionSlug == nil) {
+			if opts.Full || (f.OptionSlug == nil && (!opts.Quick || (!common && patchPath(f.Path)))) || (f.OptionSlug != nil && selectedOptions[*f.OptionSlug]) {
 				files = append(files, f)
 			}
 		}
 	}
-	if !opts.Quick {
-		appendSet(manifest.Data.Common.Files, true)
-	}
+	appendSet(manifest.Data.Common.Files, true)
 	appendSet(game.Files, false)
 	result.Files = files
 	if len(files) == 0 {
@@ -68,7 +120,7 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 		return u.verify(ctx, files, result, progress)
 	}
 	if !opts.DryRun {
-		unlock, err := acquireFileLock(filepath.Join(u.root, ".launcher-update.lock"))
+		unlock, err := acquireFileLock(filepath.Join(u.root, installationLock))
 		if err != nil {
 			return result, fmt.Errorf("could not lock installation: %w", err)
 		}
@@ -105,23 +157,23 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	result.Checked = len(files)
 	for _, f := range needed {
 		result.PlannedPaths = append(result.PlannedPaths, f.Path)
+		if progress != nil {
+			progress(Progress{Stage: "plan", Path: f.Path})
+		}
 	}
 	if opts.DryRun {
 		return result, nil
 	}
 
-	changed := false
 	failed, newToken := u.downloadFiles(ctx, needed, result.Token, progress)
 	result.Token = newToken
+	result.Downloaded = len(needed) - len(failed)
+	result.FilesUpdated = result.Downloaded > 0
 	if len(failed) != 0 {
-		result.FailedPaths = failed
-		return result, fmt.Errorf("failed to download: %s", strings.Join(failed, ", "))
+		result.FailedFiles = failed
+		return result, fileFailuresError("failed to download", failed)
 	}
-	if len(needed) > 0 {
-		result.Downloaded = len(needed)
-		result.FilesUpdated = true
-		changed = true
-	}
+	changed := result.FilesUpdated
 	manifestPaths := make(map[string]bool, len(files))
 	for _, f := range files {
 		path, _ := u.destination(f.Path, false)
@@ -129,31 +181,81 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	}
 	for _, f := range files {
 		path, _ := u.destination(f.Path, false)
-		if removeCaseVariants(path, manifestPaths) {
+		for _, stale := range removeCaseVariants(path, manifestPaths) {
+			stale = u.relativePath(stale)
+			result.RemovedPaths = append(result.RemovedPaths, stale)
+			if progress != nil {
+				progress(Progress{Stage: "remove", Path: stale})
+			}
 			changed = true
 			result.FilesUpdated = true
 		}
 	}
-	if game.Realmlist != "" {
-		path, err := u.destination("Data/enUS/realmlist.wtf", true)
-		if err != nil {
-			return result, err
-		}
-		contents := []byte("set realmlist " + game.Realmlist + "\n")
-		old, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) || (err == nil && strings.TrimRight(string(old), "\n") != strings.TrimSuffix(string(contents), "\n")) {
-			if err := writeAtomic(path, contents); err != nil {
-				return result, err
-			}
-			result.RealmlistUpdated = true
-			changed = true
-		} else if err != nil {
+	if locale != "" {
+		if err := u.validateLocalePack(locale); err != nil {
 			return result, err
 		}
 	}
+	if game.Realmlist != "" {
+		realmPaths := [2]string{"Data/enUS/realmlist.wtf", localeRealmlist}
+		contents := []byte("set realmlist " + game.Realmlist + "\n")
+		for _, rel := range realmPaths {
+			if rel == "" {
+				continue
+			}
+			path, err := u.destination(rel, true)
+			if err != nil {
+				return result, err
+			}
+			old, err := os.ReadFile(path)
+			if errors.Is(err, os.ErrNotExist) || (err == nil && !bytes.Equal(old, contents)) {
+				if err := writeAtomic(path, contents); err != nil {
+					return result, err
+				}
+				result.RealmlistUpdated = true
+				changed = true
+				if progress != nil {
+					progress(Progress{Stage: "update", Path: rel})
+				}
+			} else if err != nil {
+				return result, err
+			}
+		}
+	}
+	if locale != "" {
+		updated, err := u.writeGameCVars([]gameCVar{{"locale", locale}}, false)
+		if err != nil {
+			return result, err
+		}
+		if updated {
+			changed = true
+			result.FilesUpdated = true
+			if progress != nil {
+				progress(Progress{Stage: "update", Path: "WTF/Config.wtf"})
+			}
+		}
+	}
+	if opts.ManageHD && !opts.Full && !opts.Quick {
+		removed, err := u.disableHDPatches(options, selectedOptions, progress)
+		result.RemovedPaths = append(result.RemovedPaths, removed...)
+		if err != nil {
+			return result, err
+		}
+		if len(removed) > 0 {
+			changed = true
+			result.FilesUpdated = true
+		}
+	}
 	if changed {
-		if err := u.clearCache(); err != nil {
+		removed, err := u.clearCache(progress)
+		result.RemovedPaths = append(result.RemovedPaths, removed...)
+		if err != nil {
 			return result, fmt.Errorf("updated files but could not clear cache: %w", err)
+		}
+	}
+	if game.Slug == "roguelike" && !opts.Quick {
+		if err := os.Remove(filepath.Join(u.root, ptrInstallMarker)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return result, fmt.Errorf("could not mark PTR installed: %w", err)
 		}
 	}
 	return result, nil
@@ -262,7 +364,7 @@ func fileMD5(path string) (string, error) {
 }
 
 func (u *Updater) verify(ctx context.Context, files []ManifestFile, result UpdateResult, progress ProgressFunc) (UpdateResult, error) {
-	var bad []string
+	var bad []FileFailure
 	manifestPaths := make(map[string]bool, len(files))
 	for _, f := range files {
 		path, _ := u.destination(f.Path, false)
@@ -276,13 +378,18 @@ func (u *Updater) verify(ctx context.Context, files []ManifestFile, result Updat
 		got, err := fileMD5(path)
 		want, _ := manifestMD5(f.Hash)
 		result.Checked++
-		if errors.Is(err, os.ErrNotExist) {
+		var issue, detail string
+		switch {
+		case errors.Is(err, os.ErrNotExist):
 			result.Missing++
-			bad = append(bad, f.Path)
-		} else if err != nil || got != want {
+			issue, detail = "missing", "file is missing"
+		case err != nil:
 			result.Mismatched++
-			bad = append(bad, f.Path)
-		} else {
+			issue, detail = "unreadable", err.Error()
+		case got != want:
+			result.Mismatched++
+			issue, detail = "mismatch", "checksum mismatch"
+		default:
 			result.Current++
 			if progress != nil {
 				for _, stale := range findCaseVariants(path, manifestPaths) {
@@ -290,15 +397,47 @@ func (u *Updater) verify(ctx context.Context, files []ManifestFile, result Updat
 				}
 			}
 		}
+		if issue != "" {
+			bad = append(bad, FileFailure{Path: f.Path, Reason: detail})
+		}
 		if progress != nil {
-			progress(Progress{Stage: "verify", Path: f.Path, Current: i + 1, Total: len(files)})
+			progress(Progress{Stage: "verify", Path: f.Path, Current: i + 1, Total: len(files), Issue: issue, Message: detail})
 		}
 	}
 	if len(bad) != 0 {
-		result.FailedPaths = bad
-		return result, fmt.Errorf("verification failed: %s", strings.Join(bad, ", "))
+		result.FailedFiles = bad
+		return result, fileFailuresError("verification failed", bad)
 	}
 	return result, nil
+}
+
+func fileFailuresError(summary string, failed []FileFailure) error {
+	var report strings.Builder
+	report.WriteString(summary)
+	report.WriteString(":")
+	for _, file := range failed {
+		report.WriteByte('\n')
+		report.WriteString(file.Path)
+		report.WriteString(": ")
+		report.WriteString(file.Reason)
+	}
+	return errors.New(report.String())
+}
+
+func downloadCause(err error) string {
+	var status *HTTPError
+	if errors.As(err, &status) {
+		// The response message may include a signed URL. Only report the status.
+		return strings.TrimSpace(fmt.Sprintf("HTTP %d %s", status.StatusCode, http.StatusText(status.StatusCode)))
+	}
+	var request *url.Error
+	if errors.As(err, &request) {
+		if request.Timeout() {
+			return "network request timed out"
+		}
+		return "network request failed"
+	}
+	return err.Error()
 }
 
 func isAuthError(err error) bool {
@@ -311,12 +450,19 @@ type downloadJob struct {
 	url  string
 }
 type downloadResult struct {
-	job  downloadJob
-	err  error
-	auth bool
+	job downloadJob
+	err error
 }
 
-func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token string, progress ProgressFunc) ([]string, string) {
+func (u *Updater) downloadLink(ctx context.Context, token string, f ManifestFile) (downloadJob, error) {
+	raw, err := u.api.DownloadURL(ctx, token, f.ID)
+	if err == nil {
+		err = validHTTPS(raw)
+	}
+	return downloadJob{file: f, url: raw}, err
+}
+
+func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token string, progress ProgressFunc) ([]FileFailure, string) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	results := make(chan downloadResult, len(files))
@@ -326,59 +472,58 @@ func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			url, err := u.api.DownloadURL(ctx, token, f.ID)
-			if err != nil {
-				results <- downloadResult{job: downloadJob{file: f}, err: err, auth: isAuthError(err)}
-				return
-			}
-			if err := validHTTPS(url); err != nil {
-				results <- downloadResult{job: downloadJob{file: f, url: url}, err: err}
-				return
-			}
-			results <- downloadResult{job: downloadJob{file: f, url: url}}
+			job, err := u.downloadLink(ctx, token, f)
+			results <- downloadResult{job: job, err: err}
 		}(f)
 	}
 	wg.Wait()
 	close(results)
 	var downloadJobs []downloadJob
-	var authJobs []downloadJob
-	var failed []string
+	var authJobs []downloadResult
+	var failed []FileFailure
+	failLink := func(path string, err error) {
+		failed = append(failed, FileFailure{Path: path, Reason: "request download link: " + downloadCause(err)})
+	}
 	for r := range results {
-		if r.auth {
-			authJobs = append(authJobs, r.job)
-		} else if r.err != nil {
-			failed = append(failed, r.job.file.Path)
-		} else {
+		switch {
+		case r.err == nil:
 			downloadJobs = append(downloadJobs, r.job)
+		case isAuthError(r.err):
+			authJobs = append(authJobs, r)
+		default:
+			failLink(r.job.file.Path, r.err)
 		}
 	}
 	if len(authJobs) > 0 {
 		if u.auth == nil {
-			for _, j := range authJobs {
-				failed = append(failed, j.file.Path)
+			for _, r := range authJobs {
+				failLink(r.job.file.Path, r.err)
 			}
 		} else {
 			renewed, _, err := u.auth.Refresh(ctx)
 			if err != nil || renewed == "" {
-				for _, j := range authJobs {
-					failed = append(failed, j.file.Path)
+				if err == nil {
+					err = errors.New("no session token returned")
+				}
+				reason := "renew sign-in: " + downloadCause(err)
+				for _, r := range authJobs {
+					failed = append(failed, FileFailure{Path: r.job.file.Path, Reason: reason})
 				}
 			} else {
 				token = renewed
-				for _, j := range authJobs {
-					url, err := u.api.DownloadURL(ctx, token, j.file.ID)
-					if err != nil || validHTTPS(url) != nil {
-						failed = append(failed, j.file.Path)
+				for _, r := range authJobs {
+					job, err := u.downloadLink(ctx, token, r.job.file)
+					if err != nil {
+						failLink(r.job.file.Path, err)
 						continue
 					}
-					j.url = url
-					downloadJobs = append(downloadJobs, j)
+					downloadJobs = append(downloadJobs, job)
 				}
 			}
 		}
 	}
 	failed = append(failed, u.transfer(ctx, downloadJobs, progress)...)
-	sort.Strings(failed)
+	slices.SortFunc(failed, func(a, b FileFailure) int { return strings.Compare(a.Path, b.Path) })
 	return failed, token
 }
 
@@ -390,15 +535,16 @@ func validHTTPS(raw string) error {
 	return nil
 }
 
-func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress ProgressFunc) []string {
+func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress ProgressFunc) []FileFailure {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	var mu sync.Mutex
-	var failed []string
+	var failed []FileFailure
 	var progressMu sync.Mutex
-	for i, job := range jobs {
+	completed := 0
+	for _, job := range jobs {
 		wg.Add(1)
-		go func(i int, job downloadJob) {
+		go func() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -412,15 +558,17 @@ func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress Pro
 				}
 			}
 			if err != nil {
+				reason := downloadCause(err)
 				mu.Lock()
-				failed = append(failed, job.file.Path)
+				failed = append(failed, FileFailure{Path: job.file.Path, Reason: reason})
 				mu.Unlock()
 			} else if progress != nil {
 				progressMu.Lock()
-				progress(Progress{Stage: "download", Path: job.file.Path, Current: i + 1, Total: len(jobs)})
+				completed++
+				progress(Progress{Stage: "download", Path: job.file.Path, Current: completed, Total: len(jobs)})
 				progressMu.Unlock()
 			}
-		}(i, job)
+		}()
 	}
 	wg.Wait()
 	return failed
@@ -476,11 +624,11 @@ func findCaseVariants(target string, manifestPaths map[string]bool) []string {
 	return variants
 }
 
-func removeCaseVariants(target string, manifestPaths map[string]bool) bool {
-	removed := false
+func removeCaseVariants(target string, manifestPaths map[string]bool) []string {
+	var removed []string
 	for _, variant := range findCaseVariants(target, manifestPaths) {
 		if err := os.Remove(variant); err == nil {
-			removed = true
+			removed = append(removed, variant)
 		}
 	}
 	return removed
@@ -506,14 +654,23 @@ func writeAtomic(target string, data []byte) error {
 	return os.Rename(name, target)
 }
 
-func (u *Updater) clearCache() error {
+func (u *Updater) relativePath(path string) string {
+	relative, err := filepath.Rel(u.root, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(relative)
+}
+
+func (u *Updater) clearCache(progress ProgressFunc) ([]string, error) {
 	path, err := u.destination("Cache", true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(path, 0755); err != nil {
-		return err
+		return nil, err
 	}
+	var removed []string
 	if err := filepath.WalkDir(path, func(cachePath string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -521,17 +678,151 @@ func (u *Updater) clearCache() error {
 		if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".wdb") {
 			return nil
 		}
-		return os.Remove(cachePath)
+		if err := os.Remove(cachePath); err != nil {
+			return err
+		}
+		relative := u.relativePath(cachePath)
+		removed = append(removed, relative)
+		if progress != nil {
+			progress(Progress{Stage: "remove", Path: relative})
+		}
+		return nil
 	}); err != nil {
-		return err
+		return removed, err
 	}
 	invalid, err := u.destination("Cache/invalid", true)
 	if err != nil {
-		return err
+		return removed, err
 	}
 	f, err := os.OpenFile(invalid, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		return removed, err
+	}
+	if err := f.Close(); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+func AvailableGameOptions(manifest Manifest, gameSlug string) []GameOption {
+	bySlug := make(map[string]*GameOption)
+	add := func(file ManifestFile) {
+		if file.OptionSlug == nil {
+			return
+		}
+		option := bySlug[*file.OptionSlug]
+		if option == nil {
+			option = &GameOption{Slug: *file.OptionSlug, Kind: "other"}
+			bySlug[*file.OptionSlug] = option
+		}
+		option.Paths = append(option.Paths, file.Path)
+		switch strings.ToLower(filepath.ToSlash(file.Path)) {
+		case "data/patch-h.mpq":
+			option.Kind = "hd-characters"
+		case "data/patch-g.mpq":
+			option.Kind = "hd-creatures"
+		}
+		parts := strings.Split(filepath.ToSlash(file.Path), "/")
+		if len(parts) > 1 && strings.EqualFold(parts[0], "Data") {
+			switch strings.ToLower(parts[1]) {
+			case "enus":
+				option.Kind, option.Locale = "language", "enUS"
+			case "frfr":
+				option.Kind, option.Locale = "language", "frFR"
+			case "dede":
+				option.Kind, option.Locale = "language", "deDE"
+			case "eses":
+				option.Kind, option.Locale = "language", "esES"
+			}
+		}
+	}
+	for _, file := range manifest.Data.Common.Files {
+		add(file)
+	}
+	for _, game := range manifest.Data.Games {
+		if game.Slug == gameSlug {
+			for _, file := range game.Files {
+				add(file)
+			}
+		}
+	}
+	options := make([]GameOption, 0, len(bySlug))
+	for _, option := range bySlug {
+		options = append(options, *option)
+	}
+	sort.Slice(options, func(i, j int) bool { return options[i].Slug < options[j].Slug })
+	return options
+}
+func hasGameOption(options []GameOption, kind string) bool {
+	for _, option := range options {
+		if option.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *Updater) validateLocalePack(locale string) error {
+	rel := filepath.Join("Data", locale)
+	path, err := u.destination(rel, false)
+	if err != nil {
 		return err
 	}
-	return f.Close()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("game language pack is missing under %s", rel)
+	}
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && strings.EqualFold(filepath.Ext(entry.Name()), ".mpq") {
+			return nil
+		}
+	}
+	return fmt.Errorf("no game language files (*.MPQ) found under %s", rel)
+}
+
+func (u *Updater) disableHDPatches(options []GameOption, enabled map[string]bool, progress ProgressFunc) ([]string, error) {
+	var backup string
+	var removed []string
+	for _, option := range options {
+		if enabled[option.Slug] || option.Kind != "hd-characters" && option.Kind != "hd-creatures" {
+			continue
+		}
+		for _, rel := range option.Paths {
+			if !strings.EqualFold(rel, "Data/patch-H.MPQ") && !strings.EqualFold(rel, "Data/patch-G.MPQ") {
+				continue
+			}
+			path, err := u.destination(rel, false)
+			if err != nil {
+				return removed, err
+			}
+			candidates := findCaseVariants(path, nil)
+			candidates = append(candidates, path)
+			for _, candidate := range candidates {
+				info, err := os.Lstat(candidate)
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err != nil {
+					return removed, err
+				}
+				if !info.Mode().IsRegular() {
+					return removed, fmt.Errorf("cannot disable unsafe HD file %s", u.relativePath(candidate))
+				}
+				if backup == "" {
+					backup, err = os.MkdirTemp(u.root, ".ebonhold-disabled-hd-")
+					if err != nil {
+						return removed, fmt.Errorf("could not create HD patch backup: %w", err)
+					}
+				}
+				savedPath := filepath.Join(backup, filepath.Base(candidate))
+				if err := os.Rename(candidate, savedPath); err != nil {
+					return removed, fmt.Errorf("could not move %s to HD patch backup: %w", u.relativePath(candidate), err)
+				}
+				removed = append(removed, u.relativePath(candidate))
+				if progress != nil {
+					progress(Progress{Stage: "remove", Path: u.relativePath(candidate), Message: "HD patch backed up to " + u.relativePath(savedPath)})
+				}
+			}
+		}
+	}
+	return removed, nil
 }

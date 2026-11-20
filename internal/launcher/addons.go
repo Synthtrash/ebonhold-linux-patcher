@@ -99,6 +99,9 @@ func (m *AddonManager) addonsDir(create bool) (string, error) {
 	if err != nil || !root.IsDir() || root.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("unsafe installation directory")
 	}
+	if root.Mode().Perm()&0022 != 0 {
+		return "", fmt.Errorf("installation directory %q is writable by other users", m.root)
+	}
 
 	interfaceDir := filepath.Join(m.root, "Interface")
 	if _, err := os.Lstat(interfaceDir); errors.Is(err, os.ErrNotExist) && create {
@@ -106,8 +109,12 @@ func (m *AddonManager) addonsDir(create bool) (string, error) {
 			return "", err
 		}
 	}
-	if info, err := os.Lstat(interfaceDir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	interfaceInfo, err := os.Lstat(interfaceDir)
+	if err != nil || !interfaceInfo.IsDir() || interfaceInfo.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("unsafe Interface directory")
+	}
+	if interfaceInfo.Mode().Perm()&0022 != 0 {
+		return "", fmt.Errorf("Interface directory %q is writable by other users", interfaceDir)
 	}
 
 	addonsDir := filepath.Join(interfaceDir, "AddOns")
@@ -116,8 +123,12 @@ func (m *AddonManager) addonsDir(create bool) (string, error) {
 			return "", err
 		}
 	}
-	if info, err := os.Lstat(addonsDir); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	addonsInfo, err := os.Lstat(addonsDir)
+	if err != nil || !addonsInfo.IsDir() || addonsInfo.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("unsafe AddOns directory")
+	}
+	if addonsInfo.Mode().Perm()&0022 != 0 {
+		return "", fmt.Errorf("AddOns directory %q is writable by other users", addonsDir)
 	}
 	return addonsDir, nil
 }

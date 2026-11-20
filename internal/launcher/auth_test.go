@@ -129,6 +129,25 @@ func TestRefreshUsesSavedCredentialsWithoutPrompt(t *testing.T) {
 		t.Fatalf("token=%q err=%v logins=%d prompt=%v", token, err, api.loginCalls, p.called)
 	}
 }
+func TestSavedSignInManifestFailureRetainsCause(t *testing.T) {
+	store := &CredentialStore{Root: t.TempDir()}
+	if err := store.saveCredentials(Credentials{Username: "saved", Password: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	manifestErr := errors.New("API returned HTTP 503")
+	api := &authFake{
+		loginToken: "fresh-token",
+		gamesErr:   map[string]error{"fresh-token": manifestErr},
+	}
+
+	_, _, err := (&Authenticator{API: api, Store: store}).Authenticate(context.Background(), false)
+	if !errors.Is(err, manifestErr) {
+		t.Fatalf("Authenticate() error = %v, want wrapped manifest error %v", err, manifestErr)
+	}
+	if !strings.Contains(err.Error(), "could not load manifest after saved sign-in") {
+		t.Fatalf("Authenticate() error = %v, want saved sign-in context", err)
+	}
+}
 
 func TestSavedCredentialRejectionVersusTransientFailure(t *testing.T) {
 	for _, tc := range []struct {

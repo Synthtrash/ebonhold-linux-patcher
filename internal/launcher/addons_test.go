@@ -59,6 +59,35 @@ func TestAddonResolve(t *testing.T) {
 		t.Fatal("unknown addon accepted")
 	}
 }
+func TestAddonInstalledRejectsWritableDirectoryChain(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+	}{
+		{name: "installation root"},
+		{name: "Interface", path: "Interface"},
+		{name: "AddOns", path: filepath.Join("Interface", "AddOns")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			m := NewAddonManager(&addonFake{}, root)
+			if _, err := m.addonsDir(true); err != nil {
+				t.Fatal(err)
+			}
+			target := root
+			if tc.path != "" {
+				target = filepath.Join(root, tc.path)
+			}
+			if err := os.Chmod(target, 0777); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.Installed(); err == nil ||
+				!strings.Contains(err.Error(), "writable by other users") ||
+				!strings.Contains(err.Error(), target) {
+				t.Fatalf("Installed() error = %v, want writable-directory rejection for %q", err, target)
+			}
+		})
+	}
+}
 func TestAddonInstallValidatesResponse(t *testing.T) {
 	for _, downloads := range [][]AddonDownload{{{FileID: 1, Filename: "Interface/AddOns/A.zip", URL: "https://download.test/a"}}, {{FileID: 1, Filename: "Interface/AddOns/A.zip", URL: "https://download.test/a"}, {FileID: 1, Filename: "Interface/AddOns/A.zip", URL: "https://download.test/a"}}} {
 		t.Run(map[bool]string{true: "duplicate", false: "partial"}[len(downloads) > 1], func(t *testing.T) {

@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,13 +10,17 @@ import (
 )
 
 func acquireFileLock(path string) (func() error, error) {
+	return lockFile(path, syscall.LOCK_EX)
+}
+
+func lockFile(path string, mode int) (func() error, error) {
 	parent := filepath.Dir(path)
 	parentInfo, err := os.Lstat(parent)
 	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("lock directory is missing or unsafe")
 	}
 	if parentInfo.Mode().Perm()&0022 != 0 {
-		return nil, errors.New("lock directory is writable by other users")
+		return nil, fmt.Errorf("lock directory %q is writable by other users", parent)
 	}
 
 	if info, err := os.Lstat(path); err == nil {
@@ -44,8 +49,11 @@ func acquireFileLock(path string) (func() error, error) {
 		file.Close()
 		return nil, errors.New("could not secure lock file permissions")
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(file.Fd()), mode); err != nil {
 		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errors.New("another launcher operation is using this game folder")
+		}
 		return nil, errors.New("could not lock installation")
 	}
 

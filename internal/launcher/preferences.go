@@ -13,9 +13,162 @@ import (
 )
 
 type Preferences struct {
-	ClientRoot string `json:"client_root"`
-	GameSlug   string `json:"game_slug"`
-	Manager    string `json:"manager"`
+	ProductionRoot     string       `json:"production_root,omitempty"`
+	PTRRoot            string       `json:"ptr_root,omitempty"`
+	GameSlug           string       `json:"game_slug"`
+	ProductionLaunch   LaunchTarget `json:"production_launch,omitzero"`
+	PTRLaunch          LaunchTarget `json:"ptr_launch,omitzero"`
+	ProductionSettings GameSettings `json:"production_settings,omitzero"`
+	PTRSettings        GameSettings `json:"ptr_settings,omitzero"`
+	LauncherLanguage   string       `json:"launcher_language,omitempty"`
+}
+
+type GameSettings struct {
+	Language         string `json:"language,omitempty"`
+	ManageHD         bool   `json:"manage_hd,omitempty"`
+	HDCharacters     bool   `json:"hd_characters,omitempty"`
+	HDCreatures      bool   `json:"hd_creatures,omitempty"`
+	UpdateBeforePlay bool   `json:"update_before_play,omitempty"`
+	BottlesFlags     string `json:"bottles_flags,omitempty"`
+}
+
+// BottlesArguments returns one game argument per line, preserving internal spaces.
+func (s GameSettings) BottlesArguments() []string {
+	var args []string
+	for line := range strings.SplitSeq(s.BottlesFlags, "\n") {
+		if arg := strings.TrimSpace(line); arg != "" {
+			args = append(args, arg)
+		}
+	}
+	return args
+}
+
+func (p *Preferences) UnmarshalJSON(data []byte) error {
+	type current Preferences
+	var stored struct {
+		current
+		ClientRoot string `json:"client_root"`
+		Manager    string `json:"manager"`
+	}
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	*p = Preferences(stored.current)
+	if p.ProductionLaunch.Manager == "" && stored.Manager != "unknown" {
+		p.ProductionLaunch.Manager = stored.Manager
+	}
+	if stored.ClientRoot != "" && p.ProductionRoot == "" {
+		// The legacy folder's profile is unknowable; keep it out of PTR to avoid updating a shared Production install.
+		p.ProductionRoot = stored.ClientRoot
+	}
+	return nil
+}
+
+func (p Preferences) RootForProfile(gameSlug string) string {
+	if gameSlug == "roguelike" {
+		return p.PTRRoot
+	}
+	return p.ProductionRoot
+}
+
+func (p *Preferences) SetRootForProfile(gameSlug, root string) {
+	if p.RootForProfile(gameSlug) != root {
+		target := p.LaunchTargetForProfile(gameSlug)
+		target.ID = ""
+		p.SetLaunchTargetForProfile(gameSlug, target)
+	}
+	if gameSlug == "roguelike" {
+		p.PTRRoot = root
+	} else {
+		p.ProductionRoot = root
+	}
+}
+
+func (p Preferences) LaunchTargetForProfile(gameSlug string) LaunchTarget {
+	if gameSlug == "roguelike" {
+		return p.PTRLaunch
+	}
+	return p.ProductionLaunch
+}
+
+func (p *Preferences) SetLaunchTargetForProfile(gameSlug string, target LaunchTarget) {
+	if gameSlug == "roguelike" {
+		p.PTRLaunch = target
+	} else {
+		p.ProductionLaunch = target
+	}
+}
+
+func (p Preferences) ValidateLaunchTargetForProfile(gameSlug string, target LaunchTarget) error {
+	if err := target.Validate(); err != nil {
+		return err
+	}
+	if target.Manager == "steam" || target.Manager == "lutris" {
+		other := p.PTRLaunch
+		if gameSlug == "roguelike" {
+			other = p.ProductionLaunch
+		}
+		if target == other {
+			return errors.New("Production and PTR need different shortcuts in this manager")
+		}
+	}
+	return nil
+}
+
+func (p Preferences) GameSettingsForProfile(gameSlug string) GameSettings {
+	switch gameSlug {
+	case "roguelike":
+		return p.PTRSettings
+	case "roguelike-prod":
+		return p.ProductionSettings
+	default:
+		return GameSettings{}
+	}
+}
+
+func (p *Preferences) SetGameSettingsForProfile(gameSlug string, settings GameSettings) {
+	switch gameSlug {
+	case "roguelike":
+		p.PTRSettings = settings
+	case "roguelike-prod":
+		p.ProductionSettings = settings
+	}
+}
+
+func (p Preferences) ValidateRootForProfile(gameSlug, root string) error {
+	p.SetRootForProfile(gameSlug, root)
+	return p.ValidateRoots()
+}
+
+func (p Preferences) ValidateRoots() error {
+	if strings.TrimSpace(p.ProductionRoot) == "" || strings.TrimSpace(p.PTRRoot) == "" {
+		return nil
+	}
+	production, err := resolvedRoot(p.ProductionRoot)
+	if err != nil {
+		return errors.New("could not resolve the Production folder")
+	}
+	ptr, err := resolvedRoot(p.PTRRoot)
+	if err != nil {
+		return errors.New("could not resolve the PTR folder")
+	}
+	prodInfo, prodErr := os.Stat(production)
+	ptrInfo, ptrErr := os.Stat(ptr)
+	if inside(production, ptr) || inside(ptr, production) || (prodErr == nil && ptrErr == nil && os.SameFile(prodInfo, ptrInfo)) {
+		return errors.New("Production and PTR must use separate client folders")
+	}
+	return nil
+}
+
+func resolvedRoot(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		absolute = resolved
+	}
+	return filepath.Clean(absolute), nil
 }
 
 type PreferencesStore struct {
@@ -50,6 +203,9 @@ func (s *PreferencesStore) Load() (Preferences, error) {
 }
 
 func (s *PreferencesStore) Save(p Preferences) error {
+	if err := p.ValidateRoots(); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -170,20 +326,34 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
-func ManagerPreset(manager, launcherPath, clientRoot, gameSlug string) string {
+func (t LaunchTarget) Preset(launcherPath, clientRoot, gameSlug string, gameArgs ...string) string {
 	if clientRoot == "" {
 		return "Choose a client folder before applying this preset."
 	}
-	prefix := shellQuote(launcherPath) + " --client-dir=" + shellQuote(clientRoot) + " --game=" + shellQuote(gameSlug) + " --quick --quiet"
-	switch manager {
+	prefix := shellQuote(launcherPath) + " --client-dir=" + shellQuote(clientRoot) + " --game=" + shellQuote(gameSlug) + " --quiet"
+	switch t.Manager {
 	case "steam":
 		return prefix + " -- %command%"
 	case "lutris":
 		return prefix + " --"
-	case "bottles-flatpak":
-		return "#!/bin/sh\nexec " + prefix + " -- \\\n  flatpak run --command=bottles-cli com.usebottles.bottles run \\\n  -b 'REPLACE_WITH_BOTTLE_NAME' -e " + shellQuote("/path/to/Wow.exe")
-	case "bottles-native":
-		return "#!/bin/sh\nexec " + prefix + " -- \\\n  bottles-cli run -b 'REPLACE_WITH_BOTTLE_NAME' -e " + shellQuote("/path/to/Wow.exe")
+	case "bottles-flatpak", "bottles-native":
+		if err := t.Validate(); err != nil {
+			return ""
+		}
+		command := "bottles-cli"
+		if t.Manager == "bottles-flatpak" {
+			command = "flatpak run --command=bottles-cli com.usebottles.bottles"
+		}
+		var script strings.Builder
+		script.WriteString("#!/bin/sh\nexec " + prefix + " -- \\\n  " + command + " run --bottle=" + shellQuote(t.ID) + " -e " + shellQuote(filepath.Join(clientRoot, "Wow.exe")))
+		if len(gameArgs) > 0 {
+			script.WriteString(" --")
+			for _, arg := range gameArgs {
+				script.WriteByte(' ')
+				script.WriteString(shellQuote(arg))
+			}
+		}
+		return script.String()
 	default:
 		return ""
 	}
