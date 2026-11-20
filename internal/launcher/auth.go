@@ -2,9 +2,7 @@ package launcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -12,36 +10,54 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-var errUnsafeInstallDirectory = errors.New("installation directory is unsafe")
+const legacyPasswordDir = ".ebonhold-login"
+const legacyPasswordFile = "credentials.json"
 
-func (s *CredentialStore) tokenPath() string     { return filepath.Join(s.Root, ".updaterToken") }
-func (s *CredentialStore) credentialDir() string { return filepath.Join(s.Root, ".ebonhold-login") }
-func (s *CredentialStore) credentialPath() string {
-	return filepath.Join(s.credentialDir(), "credentials.json")
-}
-
-func (s *CredentialStore) readPrivate(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || info.Mode().Perm() != 0600 {
-		return nil, errors.New("private credential file is unsafe")
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Nlink != 1 {
-		return nil, errors.New("private credential file has hard links")
-	}
-	return os.ReadFile(path)
-}
+const tokenFile = ".updaterToken"
 
 func (s *CredentialStore) Token() (string, error) {
-	b, err := s.readPrivate(s.tokenPath())
+	install, err := openInstallation(s.Root)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
+	if err != nil {
+		return "", err
+	}
+	defer install.Close()
+	dir, err := openUpdateDir(install, ".", unix.O_PATH, false)
+	if err != nil {
+		return "", err
+	}
+	defer dir.Close()
+	return readToken(dir)
+}
+
+func readToken(dir *os.File) (string, error) {
+	fd, err := unix.Openat(int(dir.Fd()), tokenFile, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	f := os.NewFile(uintptr(fd), tokenFile)
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm() != 0600 {
+		return "", errors.New("cached token file is unsafe")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 1 {
+		return "", errors.New("cached token file has hard links")
+	}
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
 	}
@@ -52,42 +68,22 @@ func (s *CredentialStore) Token() (string, error) {
 	return t, nil
 }
 
-func (s *CredentialStore) Credentials() (Credentials, bool) {
-	var c Credentials
-	dir, err := os.Lstat(s.credentialDir())
-	if err != nil || !dir.IsDir() || dir.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(dir) || dir.Mode().Perm() != 0700 {
-		return c, false
-	}
-	b, err := s.readPrivate(s.credentialPath())
+func requirePrivateInstallation(install *os.Root) error {
+	info, err := install.Stat(".")
 	if err != nil {
-		return c, false
+		return err
 	}
-	dec := json.NewDecoder(strings.NewReader(string(b)))
-	if dec.Decode(&c) != nil || c.Username == "" || c.Password == "" || strings.ContainsRune(c.Username, 0) || strings.ContainsRune(c.Password, 0) {
-		return Credentials{}, false
+	if !ownedByCurrentUser(info) || info.Mode().Perm()&0022 != 0 {
+		return errors.New("installation directory is unsafe")
 	}
-	var extra any
-	if dec.Decode(&extra) != io.EOF {
-		return Credentials{}, false
-	}
-	return c, true
+	return nil
 }
 
-func (s *CredentialStore) writePrivate(path string, data []byte) error {
-	root, err := os.Lstat(s.Root)
-	if err != nil || !root.IsDir() || root.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(root) || root.Mode().Perm()&0022 != 0 {
-		return errUnsafeInstallDirectory
+func saveToken(install *os.Root, token string) error {
+	if err := requirePrivateInstallation(install); err != nil {
+		return err
 	}
-	if filepath.Base(path) == "credentials.json" {
-		if err := os.Mkdir(s.credentialDir(), 0700); err != nil && !errors.Is(err, os.ErrExist) {
-			return errors.New("could not create credentials directory")
-		}
-		d, err := os.Lstat(s.credentialDir())
-		if err != nil || !d.IsDir() || d.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(d) || d.Mode().Perm() != 0700 {
-			return errors.New("credentials directory is unsafe")
-		}
-	}
-	if info, err := os.Lstat(path); err == nil {
+	if info, err := install.Lstat(tokenFile); err == nil {
 		st, ok := info.Sys().(*syscall.Stat_t)
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || !ok || st.Nlink != 1 {
 			return errors.New("credential destination is unsafe")
@@ -95,14 +91,14 @@ func (s *CredentialStore) writePrivate(path string, data []byte) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("could not inspect credential destination")
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".credential-*")
+	tmp := ".ebonhold-token-" + rand.Text()
+	f, err := install.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return errors.New("could not create private credential")
 	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
+	defer install.Remove(tmp)
 	if err = f.Chmod(0600); err == nil {
-		_, err = f.Write(data)
+		_, err = f.WriteString(token)
 	}
 	if err == nil {
 		err = f.Sync()
@@ -113,79 +109,100 @@ func (s *CredentialStore) writePrivate(path string, data []byte) error {
 	if err != nil {
 		return errors.New("could not write private credential")
 	}
-	if err = os.Rename(tmp, path); err != nil {
+	if err = install.Rename(tmp, tokenFile); err != nil {
 		return errors.New("could not replace private credential")
 	}
 	return nil
 }
 
-func (s *CredentialStore) saveToken(token string) error {
-	return s.writePrivate(s.tokenPath(), []byte(token))
-}
-func (s *CredentialStore) saveCredentials(c Credentials) error {
-	b, err := json.Marshal(c)
+// RemoveLegacyPassword removes an old password from a valid game folder without reading it.
+func (s *CredentialStore) RemoveLegacyPassword() error {
+	install, err := openInstallation(s.Root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
+		return fmt.Errorf("could not inspect saved game folder: %w", err)
+	}
+	defer install.Close()
+	var file unix.Stat_t
+	legacy, err := inspectLegacyPassword(install, &file)
+	if legacy == nil {
 		return err
 	}
-	return s.writePrivate(s.credentialPath(), b)
-}
-func (s *CredentialStore) clearCredentials() error {
-	if _, err := os.Lstat(s.credentialDir()); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
+	legacy.Close()
+	locked, err := lockAuthentication(install)
+	if err != nil {
+		return fmt.Errorf("could not check for an old saved password: %w", err)
 	}
-	d, err := os.Lstat(s.credentialDir())
-	if err != nil || !d.IsDir() || d.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(d) || d.Mode().Perm() != 0700 {
-		return errors.New("credentials directory is unsafe")
-	}
-	if _, err := os.Lstat(s.credentialPath()); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	if _, err := s.readPrivate(s.credentialPath()); err != nil {
-		return err
-	}
-	return os.Remove(s.credentialPath())
+	defer locked.Close()
+	return removeLegacyPassword(install, true)
 }
 
-func authLockPath(root string) (string, error) {
-	install, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
+func inspectLegacyPassword(install *os.Root, file *unix.Stat_t) (*os.File, error) {
+	dir, err := openUpdateDir(install, legacyPasswordDir, unix.O_PATH, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	}
-	install, err = filepath.EvalSymlinks(install)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("could not inspect %s: %w", legacyPasswordDir, err)
 	}
-	h := sha256.Sum256([]byte(install))
-	runtime := os.Getenv("XDG_RUNTIME_DIR")
-	var base string
-	if runtime == "" {
-		base = os.Getenv("TMPDIR")
-		if base == "" {
-			base = "/tmp"
+	if err := unix.Fstatat(int(dir.Fd()), legacyPasswordFile, file, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		dir.Close()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
 		}
-		base = filepath.Join(base, fmt.Sprintf("ebonhold-updater-%d", os.Geteuid()))
-	} else {
-		base = filepath.Join(runtime, "ebonhold-updater")
+		return nil, fmt.Errorf("could not inspect %s/%s: %w", legacyPasswordDir, legacyPasswordFile, err)
 	}
-	parent := filepath.Dir(base)
-	if info, err := os.Lstat(parent); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("authentication lock parent is unsafe")
+	return dir, nil
+}
+
+func removeLegacyPassword(install *os.Root, requireGame bool) error {
+	var file unix.Stat_t
+	dir, err := inspectLegacyPassword(install, &file)
+	if dir == nil {
+		return err
 	}
-	if err := os.Mkdir(base, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", errors.New("could not prepare authentication lock directory")
-	}
-	info, err := os.Lstat(base)
+	defer dir.Close()
+	const confirmed = legacyPasswordDir + "/" + legacyPasswordFile + " exists"
+	info, err := dir.Stat()
 	if err != nil {
-		return "", errors.New("could not inspect authentication lock directory")
+		return fmt.Errorf("%s but its directory could not be inspected: %w", confirmed, err)
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || info.Mode().Perm()&0022 != 0 {
-		return "", errors.New("authentication lock directory is unsafe")
+	if !ownedByCurrentUser(info) || info.Mode().Perm()&0022 != 0 {
+		return fmt.Errorf("%s but its directory is unsafe", confirmed)
 	}
-	return filepath.Join(base, "auth-"+hex.EncodeToString(h[:])+".lock"), nil
+	if file.Mode&unix.S_IFMT != unix.S_IFREG || file.Uid != uint32(os.Geteuid()) || file.Nlink != 1 {
+		return fmt.Errorf("%s but the file is unsafe", confirmed)
+	}
+	if err := requirePrivateInstallation(install); err != nil {
+		return fmt.Errorf("%s but cannot be removed: %w", confirmed, err)
+	}
+	if requireGame {
+		data, dataErr := install.Lstat("Data")
+		exe, exeErr := install.Lstat("Wow.exe")
+		if dataErr != nil || !data.IsDir() || exeErr != nil || !exe.Mode().IsRegular() {
+			return fmt.Errorf("%s but the folder no longer contains Data/ and a regular Wow.exe", confirmed)
+		}
+	}
+	if err := unix.Unlinkat(int(dir.Fd()), legacyPasswordFile, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s but could not be removed: %w", confirmed, err)
+	}
+	return nil
+}
+
+// Lock the opened directory so GUI and CLI share the lock even in different
+// runtime environments. This also leaves read-only game folders unchanged.
+func lockAuthentication(install *os.Root) (*os.File, error) {
+	dir, err := openUpdateDir(install, ".", os.O_RDONLY, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(dir.Fd()), unix.LOCK_EX); err != nil {
+		dir.Close()
+		return nil, fmt.Errorf("could not lock game folder for authentication: %w", err)
+	}
+	return dir, nil
 }
 
 func (a *Authenticator) Authenticate(ctx context.Context, relogin bool) (string, Manifest, error) {
@@ -200,16 +217,22 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 	if a.API == nil || a.Store == nil {
 		return "", Manifest{}, errors.New("authentication is not configured")
 	}
-	path, err := authLockPath(a.Store.Root)
+	install, err := openInstallation(a.Store.Root)
 	if err != nil {
 		return "", Manifest{}, err
 	}
-	unlock, err := acquireFileLock(path)
+	defer install.Close()
+	dir, err := lockAuthentication(install)
 	if err != nil {
 		return "", Manifest{}, err
 	}
-	defer unlock()
-	old, err := a.Store.Token()
+	defer dir.Close()
+	if !a.ReadOnly {
+		if err := removeLegacyPassword(install, false); err != nil {
+			a.Warning = fmt.Sprintf("Could not remove the old saved password at %s: %v", filepath.Join(a.Store.Root, legacyPasswordDir, legacyPasswordFile), err)
+		}
+	}
+	old, err := readToken(dir)
 	if err != nil {
 		return "", Manifest{}, errors.New("cached authentication token is unsafe")
 	}
@@ -222,30 +245,10 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 			return "", Manifest{}, errors.New("could not verify cached authentication")
 		}
 	}
-	if !relogin {
-		if c, ok := a.Store.Credentials(); ok {
-			token, e := a.API.Login(ctx, c.Username, c.Password)
-			if e != nil && !unauthorized(e) {
-				return "", Manifest{}, errors.New("saved sign-in failed temporarily")
-			}
-			if e == nil {
-				m, e := a.API.Games(ctx, token)
-				if e != nil {
-					return "", Manifest{}, fmt.Errorf("could not load manifest after saved sign-in: %w", e)
-				}
-				if !a.ReadOnly {
-					if e = a.Store.saveToken(token); e != nil {
-						return "", Manifest{}, errors.New("could not save authentication token")
-					}
-				}
-				return token, m, nil
-			}
-		}
-	}
 	if a.Prompt == nil {
 		return "", Manifest{}, errors.New("interactive sign-in is unavailable")
 	}
-	user, pass, remember, err := a.Prompt.PromptLogin(ctx, "", !a.ReadOnly)
+	user, pass, err := a.Prompt.PromptLogin(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return "", Manifest{}, err
@@ -261,19 +264,8 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 		return "", Manifest{}, errors.New("could not load manifest after sign-in")
 	}
 	if !a.ReadOnly {
-		if err := a.Store.saveToken(token); err != nil {
-			if remember && errors.Is(err, errUnsafeInstallDirectory) {
-				a.Warning = "Remember me was not saved because the client folder is not safely owned or permissioned."
-				return token, m, nil
-			}
-			return "", Manifest{}, errors.New("could not save authentication token")
-		}
-		if remember {
-			if err := a.Store.saveCredentials(Credentials{Username: user, Password: pass}); err != nil {
-				a.Warning = "Remember me was not saved; check the client folder's ownership and permissions."
-			}
-		} else if err := a.Store.clearCredentials(); err != nil {
-			return "", Manifest{}, errors.New("could not clear saved local credentials")
+		if err := saveToken(install, token); err != nil {
+			return "", Manifest{}, fmt.Errorf("could not save authentication token: %w", err)
 		}
 	}
 	return token, m, nil
@@ -288,21 +280,25 @@ func (a *Authenticator) Forget() error {
 	if a.Store == nil {
 		return errors.New("credential store is not configured")
 	}
-	path, err := authLockPath(a.Store.Root)
+	install, err := openInstallation(a.Store.Root)
 	if err != nil {
 		return err
 	}
-	unlock, err := acquireFileLock(path)
+	defer install.Close()
+	dir, err := lockAuthentication(install)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer dir.Close()
+	if err := requirePrivateInstallation(install); err != nil {
+		return err
+	}
 	var failures []error
-	if err := os.Remove(a.Store.tokenPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		failures = append(failures, err)
+	if err := unix.Unlinkat(int(dir.Fd()), tokenFile, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+		failures = append(failures, fmt.Errorf("remove cached token: %w", err))
 	}
-	if err := a.Store.clearCredentials(); err != nil {
-		failures = append(failures, fmt.Errorf("Could not clear saved local credentials: %w", err))
+	if err := removeLegacyPassword(install, false); err != nil {
+		failures = append(failures, fmt.Errorf("could not remove the old saved password: %w", err))
 	}
 	return errors.Join(failures...)
 }

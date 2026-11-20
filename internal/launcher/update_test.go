@@ -22,6 +22,7 @@ type updaterAPI struct {
 	loginCalls    int
 	downloadCalls int
 	badDownload   bool
+	onDownload    func() error
 }
 
 func (a *updaterAPI) Login(context.Context, string, string) (string, error) {
@@ -53,6 +54,11 @@ func (a *updaterAPI) Download(_ context.Context, downloadURL string, dst io.Writ
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.downloadCalls++
+	if a.onDownload != nil {
+		if err := a.onDownload(); err != nil {
+			return err
+		}
+	}
 	id := filepath.Base(downloadURL)
 	if a.badDownload {
 		_, err := dst.Write([]byte("wrong"))
@@ -169,7 +175,12 @@ func TestUpdaterBacksUpDisabledHDOnlyWhenManaged(t *testing.T) {
 	mustWrite(t, filepath.Join(root, client.Path), []byte("client"))
 	hdPath := filepath.Join(root, "Data", "Patch-H.mpq")
 	mustWrite(t, hdPath, []byte("user data"))
-	m := manifest(nil, game(client, file("2", "Data/patch-H.MPQ", []byte("official"), &slug)))
+	otherHD := filepath.Join(root, "data", "Patch-H.mpq")
+	mustWrite(t, otherHD, []byte("other user data"))
+	m := manifest(nil, game(client,
+		file("2", "Data/patch-H.MPQ", []byte("official"), &slug),
+		file("3", "data/patch-H.MPQ", []byte("official"), &slug),
+	))
 	opts := UpdateOptions{GameSlug: "retail"}
 	if _, err := u.Run(context.Background(), m, "token", opts, nil); err != nil {
 		t.Fatal(err)
@@ -181,15 +192,19 @@ func TestUpdaterBacksUpDisabledHDOnlyWhenManaged(t *testing.T) {
 	if _, err := u.Run(context.Background(), m, "token", opts, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(hdPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("disabled HD is still active: %v", err)
-	}
-	backups, err := filepath.Glob(filepath.Join(root, ".ebonhold-disabled-hd-*", "Patch-H.mpq"))
-	if err != nil || len(backups) != 1 {
-		t.Fatalf("backups = %v, %v", backups, err)
-	}
-	if got, err := os.ReadFile(backups[0]); err != nil || string(got) != "user data" {
-		t.Fatalf("disabled HD was not preserved: %q, %v", got, err)
+	for _, tc := range []struct{ path, folder, want string }{
+		{hdPath, "Data", "user data"}, {otherHD, "data", "other user data"},
+	} {
+		if _, err := os.Stat(tc.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("disabled HD is still active at %s: %v", tc.path, err)
+		}
+		backups, err := filepath.Glob(filepath.Join(root, ".ebonhold-disabled-hd-*", tc.folder, "Patch-H.mpq"))
+		if err != nil || len(backups) != 1 {
+			t.Fatalf("backups = %v, %v", backups, err)
+		}
+		if got, err := os.ReadFile(backups[0]); err != nil || string(got) != tc.want {
+			t.Fatalf("disabled HD was not preserved: %q, %v", got, err)
+		}
 	}
 }
 
@@ -253,6 +268,70 @@ func TestUpdaterAtomicReplacementAndChecksumFailure(t *testing.T) {
 	}
 }
 
+func TestUpdaterStopsWhenGameDirectoryMovesDuringDownload(t *testing.T) {
+	for _, moved := range []string{"Data", "."} {
+		t.Run(moved, func(t *testing.T) {
+			const path = "Data/patch.MPQ"
+			patch := []byte("new contents")
+			api := &updaterAPI{data: map[string][]byte{"1": patch}}
+			root, updater := setupUpdater(t, api)
+			mustWrite(t, filepath.Join(root, path), []byte("old contents"))
+			mustWrite(t, filepath.Join(root, ptrInstallMarker), nil)
+			stash := filepath.Join(t.TempDir(), "original")
+			api.onDownload = func() error {
+				folder := filepath.Join(root, moved)
+				if err := os.Rename(folder, stash); err != nil {
+					return err
+				}
+				return os.Mkdir(folder, 0700)
+			}
+			g := Game{Slug: "roguelike", Files: []ManifestFile{file("1", path, patch, nil)}}
+			res, err := updater.Run(context.Background(), manifest(nil, g), "", UpdateOptions{GameSlug: g.Slug}, nil)
+			if err == nil || !strings.Contains(err.Error(), "folder changed during the update") {
+				t.Fatalf("update did not report a moved folder: %+v, %v", res, err)
+			}
+			if moved == "Data" && res.Downloaded != 0 {
+				t.Errorf("reported a completed download outside the active folder: %+v", res)
+			}
+			markerRoot := root
+			if moved == "." {
+				markerRoot = stash
+			}
+			if !PTRNeedsInstall(markerRoot) {
+				t.Error("a partial update marked the copy ready to play")
+			}
+		})
+	}
+}
+
+func TestUpdaterTraversesSearchOnlyAncestor(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read search-only directories")
+	}
+	const path = "packs/client/patch.MPQ"
+	patch := []byte("new contents")
+	root, updater := setupUpdater(t, &updaterAPI{data: map[string][]byte{"1": patch}})
+	target := filepath.Join(root, path)
+	ancestor := filepath.Join(root, "packs")
+	mustWrite(t, target, []byte("old contents"))
+	if err := os.Chmod(ancestor, 0100); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(ancestor, 0700); err != nil {
+			t.Error(err)
+		}
+	})
+	g := game(file("1", path, patch, nil))
+	if _, err := updater.Run(context.Background(), manifest(nil, g), "", UpdateOptions{GameSlug: g.Slug}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != string(patch) {
+		t.Fatalf("patch under search-only ancestor: %q, %v", got, err)
+	}
+}
+
 func TestUpdaterReportsDownloadCauses(t *testing.T) {
 	data := []byte("expected contents")
 	api := &updaterAPI{
@@ -261,9 +340,13 @@ func TestUpdaterReportsDownloadCauses(t *testing.T) {
 			StatusCode: 429, Message: "https://cdn.example/file?signature=private-fixture",
 		}}},
 	}
-	_, updater := setupUpdater(t, api)
-	m := manifest(nil, game(file("1", "link.dat", data, nil), file("2", "hash.dat", data, nil), file("3", "ok.dat", data, nil)))
-	result, err := updater.Run(context.Background(), m, "token", UpdateOptions{GameSlug: "retail"}, nil)
+	root, updater := setupUpdater(t, api)
+	staleCache := filepath.Join(root, "Cache/old.wdb")
+	mustWrite(t, staleCache, []byte("cached game data"))
+	mustWrite(t, filepath.Join(root, ptrInstallMarker), nil)
+	g := game(file("1", "link.dat", data, nil), file("2", "hash.dat", data, nil), file("3", "ok.dat", data, nil))
+	g.Slug = "roguelike"
+	result, err := updater.Run(context.Background(), manifest(nil, g), "token", UpdateOptions{GameSlug: g.Slug}, nil)
 	if err == nil {
 		t.Fatal("expected the failed downloads to be reported")
 	}
@@ -277,6 +360,54 @@ func TestUpdaterReportsDownloadCauses(t *testing.T) {
 	}
 	if result.Downloaded != 1 {
 		t.Errorf("report counted %d successful downloads, want 1", result.Downloaded)
+	}
+	if _, err := os.Stat(staleCache); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale cache after partial update: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Cache/invalid")); err != nil {
+		t.Errorf("cache invalidation marker missing: %v", err)
+	}
+	if !PTRNeedsInstall(root) {
+		t.Error("partial update enabled first-time PTR launch")
+	}
+}
+
+func TestUpdaterFinishesPendingCacheRefreshWithoutDownloadingAgain(t *testing.T) {
+	data := []byte("patch")
+	api := &updaterAPI{data: map[string][]byte{"1": data}}
+	root, updater := setupUpdater(t, api)
+	cache := filepath.Join(root, "Cache")
+	mustWrite(t, cache, nil) // A file in the way prevents a refresh.
+	mustWrite(t, filepath.Join(root, ptrInstallMarker), nil)
+	g := Game{Slug: "roguelike", Files: []ManifestFile{file("1", "Data/patch.MPQ", data, nil)}}
+	m := manifest(nil, g)
+	ctx := context.Background()
+	result, err := updater.Run(ctx, m, "", UpdateOptions{GameSlug: g.Slug}, nil)
+	if err == nil || result.Downloaded != 1 || !PTRNeedsInstall(root) {
+		t.Fatalf("partial completion: result=%+v, err=%v", result, err)
+	}
+	if err := os.Remove(cache); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(cache, "old.wdb")
+	mustWrite(t, stale, []byte("stale"))
+	for _, opts := range []UpdateOptions{{GameSlug: g.Slug, Verify: true}, {GameSlug: g.Slug, DryRun: true}} {
+		if _, err := updater.Run(ctx, m, "", opts, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(stale); err != nil || !PTRNeedsInstall(root) {
+		t.Fatalf("read-only mode completed a pending update: %v", err)
+	}
+	result, err = NewUpdater(api, nil, root).Run(ctx, m, "", UpdateOptions{GameSlug: g.Slug}, nil)
+	if err != nil || result.Downloaded != 0 || api.downloadCalls != 1 {
+		t.Fatalf("retry: result=%+v, %d downloads, err=%v", result, api.downloadCalls, err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retry retained stale cache: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cache, "invalid")); err != nil || PTRNeedsInstall(root) {
+		t.Fatalf("retry did not make the game ready: %v", err)
 	}
 }
 
@@ -324,7 +455,17 @@ func TestUpdaterRemovesStaleCaseVariantOnlyOnUpdate(t *testing.T) {
 	mustWrite(t, target, data)
 	stale := filepath.Join(root, "Data/file.DAT")
 	mustWrite(t, stale, []byte("stale"))
-	m := manifest(nil, game(f))
+	alias := filepath.Join(root, "Data/FILE.dat")
+	if err := os.Link(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	other := file("2", "Data/Other.dat", []byte("some other game file"), nil)
+	mustWrite(t, filepath.Join(root, other.Path), []byte("some other game file"))
+	unrelated := filepath.Join(root, "Data/fIlE.dat")
+	if err := os.Link(filepath.Join(root, other.Path), unrelated); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest(nil, game(f, other))
 	if _, err := u.Run(context.Background(), m, "", UpdateOptions{GameSlug: "retail", Verify: true}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -338,10 +479,16 @@ func TestUpdaterRemovesStaleCaseVariantOnlyOnUpdate(t *testing.T) {
 	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("normal update retained stale variant")
 	}
+	if got, err := os.ReadFile(alias); err != nil || string(got) != string(data) {
+		t.Fatalf("update did not preserve a hard-link alias of the current game file: %q, %v", got, err)
+	}
+	if _, err := os.Stat(unrelated); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("update retained a stale file linked to a different selected filename")
+	}
 	if !res.FilesUpdated {
 		t.Fatal("stale cleanup should mark files updated")
 	}
-	if strings.Join(res.RemovedPaths, "|") != "Data/file.DAT" {
+	if strings.Join(res.RemovedPaths, "|") != "Data/fIlE.dat|Data/file.DAT" {
 		t.Fatalf("removed paths = %v", res.RemovedPaths)
 	}
 }
@@ -357,9 +504,7 @@ func TestUpdaterRefreshesOnceAndBoundsRenewed401(t *testing.T) {
 			_, u := setupUpdater(t, api)
 			authRoot := t.TempDir()
 			store := &CredentialStore{Root: authRoot}
-			if err := store.saveToken("old"); err != nil {
-				t.Fatal(err)
-			}
+			seedToken(t, authRoot, "old")
 			auth := &Authenticator{API: api, Store: store, Prompt: promptStub{}}
 			u.auth = auth
 			res, err := u.Run(context.Background(), manifest(nil, game(file("1", "x", data, nil))), "old", UpdateOptions{GameSlug: "retail"}, nil)
@@ -379,8 +524,8 @@ func TestUpdaterRefreshesOnceAndBoundsRenewed401(t *testing.T) {
 
 type promptStub struct{}
 
-func (promptStub) PromptLogin(context.Context, string, bool) (string, string, bool, error) {
-	return "u", "p", false, nil
+func (promptStub) PromptLogin(context.Context) (string, string, error) {
+	return "u", "p", nil
 }
 
 func TestUpdaterRealmlistAndCacheAfterSuccess(t *testing.T) {

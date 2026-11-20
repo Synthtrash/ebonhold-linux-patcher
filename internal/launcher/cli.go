@@ -15,8 +15,13 @@ import (
 	"golang.org/x/term"
 )
 
+var buildVersion = "dev"
+
+func BuildVersion() string { return buildVersion }
+
 type CLIOptions struct {
 	Help          bool
+	Version       bool
 	GUI           bool
 	Debug         bool
 	Verify        bool
@@ -57,6 +62,9 @@ func ParseArgs(args []string) (CLIOptions, error) {
 		switch {
 		case arg == "--help" || arg == "-h":
 			opts.Help = true
+			return opts, nil
+		case arg == "--version":
+			opts.Version = true
 			return opts, nil
 		case arg == "--gui":
 			opts.GUI = true
@@ -179,7 +187,7 @@ Options:
   --quick           Standalone check of required game patch files (never limits an update before launch)
   --full            Include optional common and game files
   --status          Show realm status and exit
-  --game=SLUG       Select a manifest game (default: roguelike-prod)
+  --game=SLUG       Select manifest: roguelike-prod (default) or roguelike
   --client-dir=PATH  Use a game client folder different from the launcher folder
   --list-addons     List the official add-on catalog and exit
   --check-addons    Check launcher-managed add-ons for updates
@@ -192,7 +200,8 @@ Options:
   --option=SLUG      Select an exact manifest option slug
   --quiet            Suppress routine output; warnings and errors remain
   --relogin         Ignore cached login and request fresh credentials
-  --forget-login    Remove this installation's token and saved login locally
+  --forget-login    Remove this installation's cached token and any old saved password
+  --version          Show the launcher build version and exit
   --help            Show this help
 
 Put -- before the game-manager command. Example:
@@ -213,20 +222,17 @@ func NewConsole(in io.Reader, out, errOut io.Writer, terminal, graphical bool) *
 	return &Console{In: in, Out: out, Err: errOut, Terminal: terminal, Graphical: graphical, reader: bufio.NewReader(in)}
 }
 
-func (c *Console) PromptLogin(ctx context.Context, reason string, allowRemember bool) (string, string, bool, error) {
+func (c *Console) PromptLogin(ctx context.Context) (string, string, error) {
 	if !c.Terminal && c.Graphical {
-		return c.promptZenity(ctx, reason, allowRemember)
+		return c.promptZenity(ctx)
 	}
 	if !c.Terminal {
-		return "", "", false, errors.New("no interactive sign-in is available; run the launcher once from a terminal or desktop")
-	}
-	if reason != "" {
-		fmt.Fprintln(c.Err, reason)
+		return "", "", errors.New("no interactive sign-in is available; run the launcher once from a terminal or desktop")
 	}
 	fmt.Fprint(c.Err, "Ebonhold username: ")
 	username, err := c.readLine()
 	if err != nil || strings.TrimSpace(username) == "" {
-		return "", "", false, errors.New("username was not provided")
+		return "", "", errors.New("username was not provided")
 	}
 	fmt.Fprint(c.Err, "Ebonhold password: ")
 	var password string
@@ -234,52 +240,37 @@ func (c *Console) PromptLogin(ctx context.Context, reason string, allowRemember 
 		secret, err := term.ReadPassword(int(file.Fd()))
 		fmt.Fprintln(c.Err)
 		if err != nil {
-			return "", "", false, errors.New("could not read password")
+			return "", "", errors.New("could not read password")
 		}
 		password = string(secret)
 	} else {
 		password, err = c.readLine()
 		if err != nil {
-			return "", "", false, errors.New("could not read password")
+			return "", "", errors.New("could not read password")
 		}
 	}
 	if password == "" {
-		return "", "", false, errors.New("password was not provided")
+		return "", "", errors.New("password was not provided")
 	}
-	remember := false
-	if allowRemember {
-		fmt.Fprint(c.Err, "Remember this login unencrypted on this computer? [y/N] ")
-		answer, _ := c.readLine()
-		remember = strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
-	}
-	return username, password, remember, nil
+	return username, password, nil
 }
 
-func (c *Console) promptZenity(ctx context.Context, reason string, allowRemember bool) (string, string, bool, error) {
+func (c *Console) promptZenity(ctx context.Context) (string, string, error) {
 	if _, err := exec.LookPath("zenity"); err != nil {
-		return "", "", false, errors.New("graphical sign-in needs Zenity; install it or run the launcher from a terminal")
+		return "", "", errors.New("graphical sign-in needs Zenity; install it or run the launcher from a terminal")
 	}
-	message := "Sign in to Project Ebonhold"
-	if reason != "" {
-		message += "\n" + reason
-	}
-	username, err := exec.CommandContext(ctx, "zenity", "--entry", "--title=Ebonhold Login", "--text="+message).Output()
+	username, err := exec.CommandContext(ctx, "zenity", "--entry", "--title=Ebonhold Login", "--text=Sign in to Project Ebonhold").Output()
 	if err != nil {
-		return "", "", false, errors.New("sign-in was cancelled")
+		return "", "", errors.New("sign-in was cancelled")
 	}
 	password, err := exec.CommandContext(ctx, "zenity", "--password", "--title=Ebonhold Login", "--text=Enter your password").Output()
 	if err != nil {
-		return "", "", false, errors.New("sign-in was cancelled")
-	}
-	remember := false
-	if allowRemember {
-		result, err := exec.CommandContext(ctx, "zenity", "--list", "--checklist", "--title=Ebonhold Login", "--text=Remember me stores your username and password unencrypted in a private file. Other programs running as you can read it.", "--column=Remember", "--column=Choice", "--separator=|", "FALSE", "Remember me on this computer").Output()
-		remember = err == nil && len(strings.TrimSpace(string(result))) > 0
+		return "", "", errors.New("sign-in was cancelled")
 	}
 	if strings.TrimSpace(string(username)) == "" || len(password) == 0 {
-		return "", "", false, errors.New("username and password are required")
+		return "", "", errors.New("username and password are required")
 	}
-	return strings.TrimSpace(string(username)), strings.TrimRight(string(password), "\r\n"), remember, nil
+	return strings.TrimSpace(string(username)), strings.TrimRight(string(password), "\r\n"), nil
 }
 
 func (c *Console) readLine() (string, error) {
@@ -297,6 +288,10 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 	}
 	if opts.Help {
 		WriteHelp(console.Out, "ebonhold-launcher")
+		return nil
+	}
+	if opts.Version {
+		fmt.Fprintln(console.Out, "ebonhold-launcher", BuildVersion())
 		return nil
 	}
 	if opts.GUI {
@@ -320,7 +315,7 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 			return fmt.Errorf("could not forget login: %w", err)
 		}
 		if !opts.Quiet {
-			fmt.Fprintln(console.Out, "Forgot the cached updater token and saved local login for this installation.")
+			fmt.Fprintln(console.Out, "Removed the cached session and any old saved password for this installation.")
 		}
 		return nil
 	}
@@ -353,6 +348,9 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 	}
 	var prefs Preferences
 	if !opts.Status && !opts.ListAddons && !opts.CheckAddons {
+		if !opts.Verify && !opts.DryRun && opts.GameSlug != "roguelike" && PTRNeedsInstall(root) {
+			return errors.New("this folder needs its first PTR install; use --game=roguelike with this folder")
+		}
 		if prefsStore, storeErr := NewPreferencesStore(); storeErr == nil {
 			prefs, err = prefsStore.Load()
 			if err != nil {
@@ -374,12 +372,12 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 	}
 
 	token, manifest, err := auth.Authenticate(ctx, opts.Relogin)
-	if err != nil {
-		return err
-	}
 	if auth.Warning != "" {
 		fmt.Fprintf(console.Err, "[WARN] %s\n", auth.Warning)
 		auth.Warning = ""
+	}
+	if err != nil {
+		return err
 	}
 	status, statusErr := api.Status(ctx, token)
 	if statusErr != nil {
@@ -460,7 +458,7 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 	}
 
 	updater := NewUpdater(api, auth, root)
-	updateOptions := UpdateOptions{GameSlug: game.Slug, Quick: opts.Quick && len(opts.GameArguments) == 0, Full: opts.Full, Verify: opts.Verify, DryRun: opts.DryRun, Quiet: opts.Quiet, Language: opts.Language, HDCharacters: opts.HDCharacters, HDCreatures: opts.HDCreatures, OptionSlugs: opts.OptionSlugs}
+	updateOptions := UpdateOptions{GameSlug: game.Slug, Quick: opts.Quick && len(opts.GameArguments) == 0, Full: opts.Full, Verify: opts.Verify, DryRun: opts.DryRun, Language: opts.Language, HDCharacters: opts.HDCharacters, HDCreatures: opts.HDCreatures, OptionSlugs: opts.OptionSlugs}
 	if len(opts.OptionSlugs) == 0 && !updateOptions.Quick && !opts.Full {
 		if configuredRoot := prefs.RootForProfile(game.Slug); configuredRoot != "" {
 			actual, actualErr := resolvedRoot(root)
@@ -477,6 +475,10 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 		}
 	}
 	result, err := updater.Run(ctx, manifest, token, updateOptions, func(progress Progress) {
+		if progress.Stage == "stale" {
+			fmt.Fprintf(console.Err, "[WARN] %s: %s\n", progress.Path, progress.Message)
+			return
+		}
 		if opts.Quiet {
 			return
 		}
@@ -543,6 +545,9 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 		}
 	}
 	if len(opts.GameArguments) > 0 && !opts.Verify && !opts.DryRun {
+		if PTRNeedsInstall(root) {
+			return errors.New("finish installing the PTR copy before launching it")
+		}
 		return runGame(ctx, opts.GameArguments, console)
 	}
 	return nil

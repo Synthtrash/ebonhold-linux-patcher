@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +12,8 @@ import (
 	"syscall"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -70,23 +71,30 @@ func ApplyGameCVars(root, input string) (bool, error) {
 		return false, err
 	}
 	defer unlock()
-	return (&Updater{root: root}).writeGameCVars(values, true)
-}
-
-// The caller holds the installation lock. Preserve bytes outside the named SET lines.
-func (u *Updater) writeGameCVars(values []gameCVar, backup bool) (bool, error) {
-	path, err := u.destination(filepath.Join("WTF", "Config.wtf"), true)
+	installation, err := openInstallation(root)
 	if err != nil {
 		return false, err
 	}
-	info, err := os.Lstat(filepath.Dir(path))
+	defer installation.Close()
+	return writeGameCVars(installation, values, true, nil)
+}
+
+// The caller holds the installation lock. Preserve bytes outside the named SET lines.
+func writeGameCVars(installation *os.Root, values []gameCVar, backup bool, beforeWrite func() error) (bool, error) {
+	dir, err := openUpdateDir(installation, "WTF", unix.O_PATH, true)
+	if err != nil {
+		return false, err
+	}
+	defer dir.Close()
+	info, err := dir.Stat()
 	if err != nil {
 		return false, err
 	}
 	if !info.IsDir() || info.Mode().Perm()&0022 != 0 {
 		return false, errors.New("WTF folder is unsafe or writable by other users")
 	}
-	old, err := readGameConfig(path)
+	const name = "Config.wtf"
+	old, err := readUpdateBytes(dir, name)
 	existed := err == nil
 	if !existed && !errors.Is(err, os.ErrNotExist) {
 		return false, err
@@ -130,34 +138,14 @@ func (u *Updater) writeGameCVars(values []gameCVar, backup bool) (bool, error) {
 		return false, errors.New("Config.wtf would be too large to edit")
 	}
 	if backup && existed {
-		if err := writeAtomic(path+cvarBackupSuffix, old); err != nil {
+		if err := writeUpdateBytes(dir, name+cvarBackupSuffix, old, nil); err != nil {
 			return false, fmt.Errorf("back up Config.wtf: %w", err)
 		}
 	}
-	if err := writeAtomic(path, out); err != nil {
+	if err := writeUpdateBytes(dir, name, out, beforeWrite); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func readGameConfig(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("Config.wtf is not a regular file")
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxGameConfig+1))
-	if len(data) > maxGameConfig {
-		return nil, errors.New("Config.wtf is too large to edit")
-	}
-	return data, err
 }
 
 func cvarLineIndex(line []byte, values []gameCVar) int {

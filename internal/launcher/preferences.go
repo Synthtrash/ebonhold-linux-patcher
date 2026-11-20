@@ -283,21 +283,17 @@ func ResolveLauncherRoot(argv0 string) (string, error) {
 }
 
 type Manager struct {
-	ID        string
 	Name      string
 	Installed bool
-	Details   string
 }
 
 func DetectManagers(ctx context.Context) []Manager {
 	flatpaks := flatpakApplications(ctx)
-	managers := []Manager{
-		{ID: "steam", Name: "Steam", Installed: commandOrFlatpak("steam", "com.valvesoftware.Steam", flatpaks), Details: "Launch Options"},
-		{ID: "lutris", Name: "Lutris", Installed: commandOrFlatpak("lutris", "net.lutris.Lutris", flatpaks), Details: "System options · Command prefix"},
-		{ID: "bottles", Name: "Bottles", Installed: commandOrFlatpak("bottles", "com.usebottles.bottles", flatpaks), Details: "bottles-cli wrapper"},
-		{ID: "unknown", Name: "Not sure yet", Installed: true, Details: "Setup instructions only"},
+	return []Manager{
+		{Name: "Steam", Installed: commandOrFlatpak("steam", "com.valvesoftware.Steam", flatpaks)},
+		{Name: "Lutris", Installed: commandOrFlatpak("lutris", "net.lutris.Lutris", flatpaks)},
+		{Name: "Bottles", Installed: commandOrFlatpak("bottles", "com.usebottles.bottles", flatpaks)},
 	}
-	return managers
 }
 
 func flatpakApplications(ctx context.Context) map[string]bool {

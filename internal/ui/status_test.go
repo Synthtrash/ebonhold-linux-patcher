@@ -95,6 +95,13 @@ type queuedApp struct {
 
 func (a *queuedApp) Driver() fyne.Driver { return a.driver }
 
+type testWindowWithClipboard struct {
+	fyne.Window
+	clipboard fyne.Clipboard
+}
+
+func (w *testWindowWithClipboard) Clipboard() fyne.Clipboard { return w.clipboard }
+
 type windowTestAPI struct {
 	statusTestAPI
 	online   atomic.Bool
@@ -182,7 +189,7 @@ func openTestWindowWithToken(t *testing.T, api launcher.API, ticks <-chan time.T
 	driver := &queuedDriver{Driver: base.Driver(), tasks: make(chan func(), 16)}
 	a := &queuedApp{App: base, driver: driver}
 	fyne.SetCurrentApp(a)
-	w := test.NewTempWindow(t, nil)
+	w := &testWindowWithClipboard{Window: test.NewTempWindow(t, nil), clipboard: test.NewClipboard()}
 	t.Cleanup(setupWindow(w, api, "launcher", store, prefs, ticks, fetchNews))
 	w.Show()
 	return w, driver, production
@@ -427,6 +434,22 @@ func TestVerifyFailureWithoutResultsDoesNotSuggestRepair(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsPendingCopyUnderWrongProfileBeforeSignIn(t *testing.T) {
+	api := &windowTestAPI{statusTestAPI: statusTestAPI{token: "valid-token"}}
+	w, driver, root := openTestWindowWithToken(t, api, nil, "", nil)
+	if err := os.WriteFile(filepath.Join(root, ".ebonhold-ptr-needs-update"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	tapButton(t, w.Content(), "Update")
+	tapButton(t, w.Content(), "Update files")
+	driver.until(t, "wrong profile recovery instructions instead of a sign-in prompt", func() bool {
+		_, found := findControl(w.Canvas().Overlays().Top(), func(entry *widget.Entry) bool {
+			return strings.Contains(entry.Text, "Switch to the PTR profile before updating.")
+		})
+		return found
+	})
+}
+
 type rateLimitedDownloadAPI struct{ windowTestAPI }
 
 func (*rateLimitedDownloadAPI) DownloadURL(context.Context, string, string) (string, error) {
@@ -463,8 +486,14 @@ func TestUpdateShowsWhyAFileFailed(t *testing.T) {
 	}
 	tapButton(t, w.Content(), "Technical details")
 	if _, found := findControl(w.Canvas().Overlays().Top(), func(entry *widget.Entry) bool {
-		return strings.Contains(entry.Text, path+": request download link: HTTP 429")
+		return strings.HasPrefix(entry.Text, "Launcher version: "+launcher.BuildVersion()+"\n\n") &&
+			strings.Contains(entry.Text, path+": request download link: HTTP 429")
 	}); !found {
-		t.Error("the copyable report does not tie the HTTP 429 to its path")
+		t.Error("the copyable report must identify the build and tie the HTTP 429 to its path")
+	}
+	tapButton(t, w.Canvas().Overlays().Top(), "Copy details")
+	copied := w.Clipboard().Content()
+	if !strings.HasPrefix(copied, "Launcher version: "+launcher.BuildVersion()+"\n\n") || !strings.Contains(copied, path+": request download link: HTTP 429") {
+		t.Fatalf("copied details missing build version or failure: %q", copied)
 	}
 }

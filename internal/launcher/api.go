@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,6 +43,8 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("HTTP %d", e.StatusCode)
 }
 
+var errCredentialRedirect = errors.New("API redirected a request with credentials to another origin")
+
 func NewDefaultAPI() *HTTPAPI {
 	return newHTTPAPI(defaultAPIBase, &http.Client{})
 }
@@ -61,11 +64,21 @@ func NewHTTPAPI(baseURL string, client *http.Client) (*HTTPAPI, error) {
 func newHTTPAPI(baseURL string, client *http.Client) *HTTPAPI {
 	copy := *client
 	copy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if req.URL.Scheme != "https" {
+		if req.URL.Scheme != "https" || req.URL.User != nil {
 			return errors.New("refusing an insecure HTTP redirect")
 		}
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
+		}
+		initial := via[0]
+		if initial.Body != nil || initial.Header.Get("Authorization") != "" {
+			if !strings.EqualFold(initial.URL.Hostname(), req.URL.Hostname()) ||
+				cmp.Or(initial.URL.Port(), "443") != cmp.Or(req.URL.Port(), "443") {
+				return errCredentialRedirect
+			}
+		}
+		if initial.Referer() == "" {
+			req.Header.Del("Referer")
 		}
 		return nil
 	}
@@ -253,9 +266,8 @@ func (a *HTTPAPI) jsonRequest(ctx context.Context, method, path, token string, b
 		if errors.Is(err, context.DeadlineExceeded) {
 			return errors.New("API request timed out")
 		}
-		var netErr net.Error
-		if errors.As(err, &netErr) {
-			return errors.New("API request failed")
+		if errors.Is(err, errCredentialRedirect) {
+			return errCredentialRedirect
 		}
 		return errors.New("API request failed")
 	}

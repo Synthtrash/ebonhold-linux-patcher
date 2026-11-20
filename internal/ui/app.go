@@ -93,10 +93,10 @@ type loginPrompt struct {
 	tr  translate
 }
 
-func (p loginPrompt) PromptLogin(ctx context.Context, _ string, allowRemember bool) (string, string, bool, error) {
+func (p loginPrompt) PromptLogin(ctx context.Context) (string, string, error) {
 	type answer struct {
-		user, pass   string
-		remember, ok bool
+		user, pass string
+		ok         bool
 	}
 	done := make(chan answer, 1)
 	fyne.Do(func() {
@@ -107,27 +107,20 @@ func (p loginPrompt) PromptLogin(ctx context.Context, _ string, allowRemember bo
 		user.SetPlaceHolder(p.tr("Username"))
 		pass.SetPlaceHolder(p.tr("Password"))
 		items := []*widget.FormItem{widget.NewFormItem(p.tr("Username"), user), widget.NewFormItem(p.tr("Password"), pass)}
-		remember := widget.NewCheck(p.tr("Remember sign-in on this device"), nil)
-		if allowRemember {
-			items = append(items, widget.NewFormItem("", remember))
-			warning := widget.NewLabel(p.tr("Remembering stores the username and password unencrypted in a private local file."))
-			warning.Wrapping = fyne.TextWrapWord
-			items = append(items, widget.NewFormItem(p.tr("Storage warning"), warning))
-		}
 		d := dialog.NewForm(p.tr("Sign in"), p.tr("Sign in"), p.tr("Cancel"), items, func(ok bool) {
-			done <- answer{user: user.Text, pass: pass.Text, remember: allowRemember && remember.Checked, ok: ok}
+			done <- answer{user: user.Text, pass: pass.Text, ok: ok}
 		}, p.win)
-		d.Resize(fyne.NewSize(440, 260))
+		d.Resize(fyne.NewSize(440, 210))
 		d.Show()
 	})
 	select {
 	case result := <-done:
 		if !result.ok {
-			return "", "", false, context.Canceled
+			return "", "", context.Canceled
 		}
-		return result.user, result.pass, result.remember, nil
+		return result.user, result.pass, nil
 	case <-ctx.Done():
-		return "", "", false, ctx.Err()
+		return "", "", ctx.Err()
 	}
 }
 
@@ -429,6 +422,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	var addonIDs map[string]int64
 	async := func(task func(context.Context)) { go task(windowCtx) }
 	showDetails := func(title, details string) {
+		details = tr("Launcher version: %s", launcher.BuildVersion()) + "\n\n" + details
 		entry := widget.NewMultiLineEntry()
 		entry.Wrapping = fyne.TextWrapBreak
 		entry.Scroll = fyne.ScrollVerticalOnly
@@ -448,6 +442,12 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		warning := auth.Warning
 		auth.Warning = ""
 		post(func() { showDetails(tr("Sign-in warning"), tr(warning)) })
+	}
+	authDetails := func(details string, auth *launcher.Authenticator) string {
+		if auth.Warning != "" {
+			return details + "\n\n" + auth.Warning
+		}
+		return details
 	}
 	showErr := func(title string, e error) {
 		if e == nil {
@@ -561,6 +561,27 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		return path, nil
 	}
+	migrateSavedPasswords := func(roots ...string) {
+		async(func(ctx context.Context) {
+			var failures []string
+			for _, root := range roots {
+				if ctx.Err() != nil {
+					return
+				}
+				if root == "" {
+					continue
+				}
+				if err := (&launcher.CredentialStore{Root: root}).RemoveLegacyPassword(); err != nil {
+					failures = append(failures, root+": "+err.Error())
+				}
+			}
+			if len(failures) != 0 {
+				post(func() {
+					showDetails(tr("Saved password check incomplete"), strings.Join(failures, "\n"))
+				})
+			}
+		})
+	}
 	gameActionBusy := func() bool { return updateInProgress || copyInProgress || signingIn }
 	gameRoot := func() (string, error) {
 		rootPath, err := clientRoot()
@@ -631,6 +652,10 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}()
 	}
 	runUpdate := func(rootPath, profile string, settings launcher.GameSettings, verify bool, afterUpdate func()) {
+		if !verify && profile != "roguelike" && launcher.PTRNeedsInstall(rootPath) {
+			showErr(tr("Update failed"), errors.New("This copy needs its first PTR install. Switch to the PTR profile before updating."))
+			return
+		}
 		updateHasRun, updateInProgress, updateFailed, updateVerify = true, true, false, verify
 		updateError = ""
 		updateResult = launcher.UpdateResult{}
@@ -644,8 +669,9 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			updateAuth := newAuthenticator(rootPath, verify)
 			token, manifest, e := updateAuth.Authenticate(ctx, false)
 			if e != nil {
+				details := authDetails(e.Error(), updateAuth)
 				post(func() {
-					updateInProgress, updateFailed, updateError = false, true, e.Error()
+					updateInProgress, updateFailed, updateError = false, true, details
 					if verify {
 						updateFiles.reset(tr("No verification results."))
 					} else {
@@ -653,7 +679,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 					}
 					status.SetText(tr("Sign-in failed"))
 					refreshSetup()
-					showDetails(tr("Sign-in failed"), e.Error())
+					showDetails(tr("Sign-in failed"), details)
 				})
 				return
 			}
@@ -694,7 +720,9 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 					}
 				})
 			})
-			showAuthWarning(updateAuth)
+			if e == nil || len(result.FailedFiles) > 0 {
+				showAuthWarning(updateAuth)
+			}
 			post(func() {
 				if len(updateFiles.rows) == 0 {
 					switch {
@@ -729,7 +757,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 						}
 					}
 					status.SetText(title)
-					updateError = e.Error()
+					updateError = authDetails(e.Error(), updateAuth)
 					refreshSetup()
 					if len(result.FailedFiles) == 0 {
 						showDetails(title, updateError)
@@ -842,7 +870,9 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 							showDetails(tr("Sign-in warning"), tr(auth.Warning))
 						}
 					case !errors.Is(err, context.Canceled):
-						showDetails(tr("Sign-in failed"), err.Error())
+						showDetails(tr("Sign-in failed"), authDetails(err.Error(), auth))
+					case auth.Warning != "":
+						showDetails(tr("Sign-in warning"), auth.Warning)
 					}
 				}
 				refreshSetup()
@@ -1025,7 +1055,9 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 					}
 					addonList.Show()
 					if interactive && authErr != nil && !errors.Is(authErr, context.Canceled) {
-						showDetails(tr("Add-on sign-in failed"), authErr.Error())
+						showDetails(tr("Add-on sign-in failed"), authDetails(authErr.Error(), auth))
+					} else if interactive && auth.Warning != "" {
+						showDetails(tr("Sign-in warning"), auth.Warning)
 					}
 					addonList.SetText(strings.Join(lines, "\n"))
 					if localErr != nil {
@@ -1125,8 +1157,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		async(func(ctx context.Context) {
 			auth := newAuthenticator(rootPath, false)
 			token, _, err := auth.Authenticate(ctx, false)
+			showAuthWarning(auth)
 			if err == nil {
-				showAuthWarning(auth)
 				err = manager.Install(ctx, token, ids)
 			}
 			post(func() {
@@ -1547,6 +1579,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 				setupNotice.SetText(tr("Choose a valid game folder first: %s", tr(err.Error())))
 				return
 			}
+			migrateSavedPasswords(rootPath)
 		}
 		if setupStep < 3 {
 			setupStep++
@@ -1716,7 +1749,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		var names []string
 		for _, manager := range managers {
-			if manager.Installed && manager.ID != "unknown" {
+			if manager.Installed {
 				names = append(names, manager.Name)
 			}
 		}
@@ -2201,6 +2234,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	background := container.NewStack(canvas.NewRectangle(hexColor(colorBG)), launcherBackdrop(), dimWallpaper)
 	w.SetContent(container.NewBorder(topbar, nil, nil, nil, background, screenStack))
 	switchScreen("home")
+	migrateSavedPasswords(prefs.ProductionRoot, prefs.PTRRoot)
 	loadNews()
 	if notice == "" && strings.TrimSpace(prefs.RootForProfile(prefs.GameSlug)) == "" {
 		if prefs.GameSlug == "roguelike" && prefs.ProductionRoot != "" {

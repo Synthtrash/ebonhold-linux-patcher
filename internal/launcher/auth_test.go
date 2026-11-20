@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type authFake struct {
@@ -40,26 +42,40 @@ func (*authFake) AddonDownloads(context.Context, string, []int64) ([]AddonDownlo
 func (*authFake) Download(context.Context, string, io.Writer) error { return nil }
 
 type authPrompt struct {
-	called        bool
-	remember      bool
-	allowRemember bool
+	called bool
 }
 
-func (p *authPrompt) PromptLogin(_ context.Context, _ string, allowRemember bool) (string, string, bool, error) {
+func (p *authPrompt) PromptLogin(context.Context) (string, string, error) {
 	p.called = true
-	p.allowRemember = allowRemember
-	return "manual", "password", p.remember, nil
+	return "manual", "password", nil
 }
 
-func TestAuthenticateReusesTokenWithoutReadingCredentials(t *testing.T) {
+func writeLegacyPassword(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, legacyPasswordDir)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, legacyPasswordFile)
+	if err := os.WriteFile(path, []byte(`{"username":"fixture","password":"fixture"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func seedToken(t *testing.T, root, token string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, tokenFile), []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticateKeepsCachedTokenAndRemovesOldPassword(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
-	if err := os.WriteFile(s.tokenPath(), []byte("good"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(s.credentialDir(), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("/missing", s.credentialPath()); err != nil {
+	seedToken(t, s.Root, "good")
+	path := writeLegacyPassword(t, s.Root)
+	other := filepath.Join(filepath.Dir(path), "other")
+	if err := os.WriteFile(other, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	api := &authFake{gamesErr: map[string]error{}}
@@ -68,126 +84,79 @@ func TestAuthenticateReusesTokenWithoutReadingCredentials(t *testing.T) {
 	if err != nil || token != "good" || p.called || api.loginCalls != 0 {
 		t.Fatalf("token=%q err=%v prompt=%v logins=%d", token, err, p.called, api.loginCalls)
 	}
-}
-
-func TestReadonlyPromptDisallowsRememberConsent(t *testing.T) {
-	s := &CredentialStore{Root: t.TempDir()}
-	p := &authPrompt{remember: true}
-	api := &authFake{loginToken: "new", gamesErr: map[string]error{}}
-	_, _, err := (&Authenticator{API: api, Store: s, Prompt: p, ReadOnly: true}).Authenticate(context.Background(), false)
-	if err != nil {
-		t.Fatal(err)
+	if cached, err := s.Token(); err != nil || cached != "good" {
+		t.Fatalf("upgrade did not preserve cached token: %q, %v", cached, err)
 	}
-	if p.allowRemember {
-		t.Fatal("read-only mode allowed remember consent")
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old password file remains: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("upgrade removed an unrelated file: %v", err)
 	}
 }
 
-func TestCredentialPermissionsAndSymlinkRejection(t *testing.T) {
+func TestAuthenticateReadOnlyLeavesSavedFilesAlone(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
-	if err := s.saveCredentials(Credentials{"user", "pass"}); err != nil {
-		t.Fatal(err)
+	path := writeLegacyPassword(t, s.Root)
+	seedToken(t, s.Root, "expired")
+	prompt := &authPrompt{}
+	api := &authFake{loginToken: "new", gamesErr: map[string]error{"expired": &HTTPError{StatusCode: http.StatusUnauthorized}}}
+	token, _, err := (&Authenticator{API: api, Store: s, Prompt: prompt, ReadOnly: true}).Authenticate(context.Background(), false)
+	if err != nil || token != "new" || !prompt.called {
+		t.Fatalf("read-only login: %q, %v, prompted=%t", token, err, prompt.called)
 	}
-	di, _ := os.Stat(s.credentialDir())
-	fi, _ := os.Stat(s.credentialPath())
-	if di.Mode().Perm() != 0700 || fi.Mode().Perm() != 0600 {
-		t.Fatalf("permissions dir=%o file=%o", di.Mode().Perm(), fi.Mode().Perm())
+	if cached, err := s.Token(); err != nil || cached != "expired" {
+		t.Fatalf("read-only auth replaced the cached token: %q, %v", cached, err)
 	}
-	victim := filepath.Join(t.TempDir(), "victim")
-	if err := os.WriteFile(victim, []byte(`{"username":"user","password":"pass"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(s.credentialPath()); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(victim, s.credentialPath()); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := s.Credentials(); ok {
-		t.Fatal("accepted symlink credentials")
-	}
-	if err := s.saveCredentials(Credentials{"replacement", "secret"}); err == nil {
-		t.Fatal("replaced symlink destination")
-	}
-	b, _ := os.ReadFile(victim)
-	if string(b) != `{"username":"user","password":"pass"}` {
-		t.Fatal("symlink victim modified")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("read-only auth removed the old password: %v", err)
 	}
 }
-func TestRefreshUsesSavedCredentialsWithoutPrompt(t *testing.T) {
+
+func TestAuthenticatePromptsForExpiredSessionAndSavesOnlyToken(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
-	if err := s.saveToken("old"); err != nil {
-		t.Fatal(err)
+	path := writeLegacyPassword(t, s.Root)
+	seedToken(t, s.Root, "expired")
+	prompt := &authPrompt{}
+	api := &authFake{loginToken: "renewed", gamesErr: map[string]error{"expired": &HTTPError{StatusCode: http.StatusUnauthorized}}}
+	token, _, err := (&Authenticator{API: api, Store: s, Prompt: prompt}).Authenticate(context.Background(), false)
+	if err != nil || token != "renewed" || !prompt.called || api.loginCalls != 1 {
+		t.Fatalf("login: %q, %v, prompted=%t, logins=%d", token, err, prompt.called, api.loginCalls)
 	}
-	if err := s.saveCredentials(Credentials{"saved", "secret"}); err != nil {
-		t.Fatal(err)
+	if cached, err := s.Token(); err != nil || cached != "renewed" {
+		t.Fatalf("cached token = %q, %v", cached, err)
 	}
-	api := &authFake{loginToken: "renewed", gamesErr: map[string]error{}}
-	p := &authPrompt{}
-	token, _, err := (&Authenticator{API: api, Store: s, Prompt: p}).Refresh(context.Background())
-	if err != nil || token != "renewed" || api.loginCalls != 1 || p.called {
-		t.Fatalf("token=%q err=%v logins=%d prompt=%v", token, err, api.loginCalls, p.called)
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("login left a password file: %v", err)
 	}
 }
-func TestSavedSignInManifestFailureRetainsCause(t *testing.T) {
+
+func TestSignInWithoutManifestDoesNotSaveSession(t *testing.T) {
 	store := &CredentialStore{Root: t.TempDir()}
-	if err := store.saveCredentials(Credentials{Username: "saved", Password: "secret"}); err != nil {
-		t.Fatal(err)
-	}
-	manifestErr := errors.New("API returned HTTP 503")
-	api := &authFake{
-		loginToken: "fresh-token",
-		gamesErr:   map[string]error{"fresh-token": manifestErr},
-	}
+	api := &authFake{loginToken: "fresh-token", gamesErr: map[string]error{"fresh-token": &HTTPError{StatusCode: http.StatusServiceUnavailable}}}
 
-	_, _, err := (&Authenticator{API: api, Store: store}).Authenticate(context.Background(), false)
-	if !errors.Is(err, manifestErr) {
-		t.Fatalf("Authenticate() error = %v, want wrapped manifest error %v", err, manifestErr)
+	_, _, err := (&Authenticator{API: api, Store: store, Prompt: &authPrompt{}}).Authenticate(context.Background(), false)
+	if err == nil {
+		t.Fatal("reported a successful sign-in without the manifest")
 	}
-	if !strings.Contains(err.Error(), "could not load manifest after saved sign-in") {
-		t.Fatalf("Authenticate() error = %v, want saved sign-in context", err)
+	if cached, err := store.Token(); err != nil || cached != "" {
+		t.Fatalf("failed sign-in saved a token: %q, %v", cached, err)
 	}
 }
 
-func TestSavedCredentialRejectionVersusTransientFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		loginErr error
-		prompt   bool
-	}{{"rejected", &HTTPError{StatusCode: http.StatusUnauthorized}, true}, {"transient", errors.New("network detail"), false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &CredentialStore{Root: t.TempDir()}
-			if err := s.saveCredentials(Credentials{"saved", "secret"}); err != nil {
-				t.Fatal(err)
-			}
-			api := &authFake{loginToken: "manual-token", loginErr: tc.loginErr}
-			p := &authPrompt{}
-			_, _, err := (&Authenticator{API: api, Store: s, Prompt: p}).Authenticate(context.Background(), false)
-			if tc.prompt != p.called {
-				t.Fatalf("prompt called=%v err=%v", p.called, err)
-			}
-			if tc.prompt && err != nil {
-				t.Fatal(err)
-			}
-			if !tc.prompt && err == nil {
-				t.Fatal("expected transient error")
-			}
-		})
-	}
-}
 func TestForgetRemovesUnsafeTokenPath(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
 	target := filepath.Join(t.TempDir(), "target")
 	if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(target, s.tokenPath()); err != nil {
+	if err := os.Symlink(target, filepath.Join(s.Root, tokenFile)); err != nil {
 		t.Fatal(err)
 	}
 	if err := (&Authenticator{Store: s}).Forget(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(s.tokenPath()); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(s.Root, tokenFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("token path remains: %v", err)
 	}
 	data, err := os.ReadFile(target)
@@ -198,8 +167,8 @@ func TestForgetRemovesUnsafeTokenPath(t *testing.T) {
 
 func TestForgetIsLocalAndRemovesState(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
-	_ = s.saveToken("token")
-	_ = s.saveCredentials(Credentials{"user", "pass"})
+	seedToken(t, s.Root, "token")
+	path := writeLegacyPassword(t, s.Root)
 	api := &authFake{gamesErr: map[string]error{"token": errors.New("must not call")}}
 	if err := (&Authenticator{API: api, Store: s}).Forget(); err != nil {
 		t.Fatal(err)
@@ -207,101 +176,131 @@ func TestForgetIsLocalAndRemovesState(t *testing.T) {
 	if api.gamesCalls != 0 || api.loginCalls != 0 {
 		t.Fatal("forget made network requests")
 	}
-	for _, path := range []string{s.tokenPath(), s.credentialPath()} {
+	for _, path := range []string{filepath.Join(s.Root, tokenFile), path} {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("state remains at %s", path)
 		}
 	}
 }
-func TestRememberSaveFailureWarnsWithoutDiscardingAuthentication(t *testing.T) {
+
+func TestLegacyPasswordCleanupDoesNotFollowLinkedFolder(t *testing.T) {
 	store := &CredentialStore{Root: t.TempDir()}
-	outside := t.TempDir()
-	if err := os.Symlink(outside, store.credentialDir()); err != nil {
+	outside := writeLegacyPassword(t, t.TempDir())
+	if err := os.Symlink(filepath.Dir(outside), filepath.Join(store.Root, legacyPasswordDir)); err != nil {
 		t.Fatal(err)
 	}
-	prompt := &authPrompt{remember: true}
 	auth := &Authenticator{
-		API:    &authFake{loginToken: "new-token", gamesErr: map[string]error{}},
+		API:    &authFake{loginToken: "new-token"},
 		Store:  store,
-		Prompt: prompt,
+		Prompt: &authPrompt{},
 	}
 	token, _, err := auth.Authenticate(context.Background(), false)
-	if err != nil || token != "new-token" {
-		t.Fatalf("authentication = %q, %v", token, err)
+	if err != nil || token != "new-token" || !strings.Contains(auth.Warning, "Could not remove the old saved password") {
+		t.Fatalf("expected a cleanup warning with a working session, got %q, %v, %q", token, err, auth.Warning)
 	}
-	if !strings.Contains(auth.Warning, "Remember me was not saved") {
-		t.Fatalf("missing storage warning: %q", auth.Warning)
-	}
-	if got, err := store.Token(); err != nil || got != "new-token" {
-		t.Fatalf("token = %q, %v", got, err)
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("cleanup removed a file outside the installation: %v", err)
 	}
 }
 
 func TestForgetReportsCredentialClearFailure(t *testing.T) {
 	store := &CredentialStore{Root: t.TempDir()}
-	if err := store.saveToken("token"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(store.credentialDir(), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(store.credentialPath(), 0700); err != nil {
+	seedToken(t, store.Root, "token")
+	if err := os.MkdirAll(filepath.Join(store.Root, legacyPasswordDir, legacyPasswordFile), 0700); err != nil {
 		t.Fatal(err)
 	}
 	err := (&Authenticator{Store: store}).Forget()
-	if err == nil || !strings.Contains(err.Error(), "Could not clear saved local credentials") {
+	if err == nil || !strings.Contains(err.Error(), "could not remove the old saved password") {
 		t.Fatalf("Forget error = %v", err)
 	}
-	if _, err := os.Lstat(store.tokenPath()); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(store.Root, tokenFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("token remains after forget: %v", err)
 	}
 }
-func TestRememberWithUnsafeClientFolderWarnsAndKeepsSession(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
-	root := t.TempDir()
-	if err := os.Chmod(root, 0777); err != nil {
+
+func TestForgetDoesNotRemoveTokenDirectory(t *testing.T) {
+	store := &CredentialStore{Root: t.TempDir()}
+	path := filepath.Join(store.Root, tokenFile)
+	if err := os.Mkdir(path, 0700); err != nil {
 		t.Fatal(err)
 	}
-	store := &CredentialStore{Root: root}
-	prompt := &authPrompt{remember: true}
-	auth := &Authenticator{
-		API:    &authFake{loginToken: "session", gamesErr: map[string]error{}},
-		Store:  store,
-		Prompt: prompt,
+	if err := (&Authenticator{Store: store}).Forget(); err == nil {
+		t.Fatal("forget accepted a directory as the cached token")
 	}
-	token, _, err := auth.Authenticate(context.Background(), false)
-	if err != nil || token != "session" {
-		t.Fatalf("authentication = %q, %v", token, err)
-	}
-	if !strings.Contains(auth.Warning, "Remember me was not saved") {
-		t.Fatalf("missing unsafe-folder warning: %q", auth.Warning)
-	}
-	if _, err := os.Lstat(store.tokenPath()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("unsafe client folder received a token: %v", err)
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		t.Fatalf("forget changed the directory: %v", err)
 	}
 }
-func TestAuthLockPathConcurrentInitialization(t *testing.T) {
-	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
-	root := t.TempDir()
-	const callers = 32
-	start := make(chan struct{})
-	errs := make(chan error, callers)
-	var wg sync.WaitGroup
-	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			_, err := authLockPath(root)
-			errs <- err
-		}()
+
+func TestDesktopCleanupReportsUnverifiedGameFolder(t *testing.T) {
+	store := &CredentialStore{Root: t.TempDir()}
+	path := writeLegacyPassword(t, store.Root)
+	if err := store.RemoveLegacyPassword(); err == nil || !strings.Contains(err.Error(), "Data/ and a regular Wow.exe") {
+		t.Fatalf("cleanup did not report the missing game files: %v", err)
 	}
-	close(start)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("cleanup removed a password from an unverified folder: %v", err)
+	}
+}
+
+func TestDesktopCleanupDoesNotWarnAboutAbsentPassword(t *testing.T) {
+	store := &CredentialStore{Root: t.TempDir()}
+	dir := filepath.Join(store.Root, legacyPasswordDir)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(store.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := unix.Flock(int(held.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- store.RemoveLegacyPassword() }()
+	select {
+	case err := <-done:
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("warned about an old password that was not present: %v", err)
 		}
+	case <-time.After(5 * time.Second):
+		held.Close()
+		<-done
+		t.Fatal("cleanup waited for the authentication lock with no password to remove")
+	}
+}
+
+func TestAuthenticationLockIsSharedWithoutCreatingFiles(t *testing.T) {
+	path := t.TempDir()
+	root, err := openInstallation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	locked, err := lockAuthentication(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Close()
+	other, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := unix.Flock(int(other.Fd()), unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+		t.Fatalf("another process can take the installation lock while it is held: %v", err)
+	}
+	if err := locked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(other.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("installation lock did not release: %v", err)
+	}
+	if entries, err := os.ReadDir(path); err != nil || len(entries) != 0 {
+		t.Fatalf("authentication lock wrote to the game folder: %v, %v", entries, err)
 	}
 }

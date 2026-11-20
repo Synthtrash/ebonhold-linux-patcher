@@ -18,6 +18,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type Updater struct {
@@ -30,10 +33,12 @@ func NewUpdater(api API, auth *Authenticator, root string) *Updater {
 	return &Updater{api: api, auth: auth, root: root}
 }
 
+const cachePendingName = ".ebonhold-cache-pending"
+
 var numericFileID = regexp.MustCompile(`^[1-9][0-9]*$`)
 
-func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts UpdateOptions, progress ProgressFunc) (UpdateResult, error) {
-	result := UpdateResult{Token: token}
+func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts UpdateOptions, progress ProgressFunc) (result UpdateResult, runErr error) {
+	result.Token = token
 	var game *Game
 	for i := range manifest.Data.Games {
 		if manifest.Data.Games[i].Slug == opts.GameSlug {
@@ -44,7 +49,6 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	if game == nil {
 		return result, fmt.Errorf("game %q not found in manifest", opts.GameSlug)
 	}
-	result.Game = *game
 	var selectedOptions map[string]bool
 	var options []GameOption
 	if len(opts.OptionSlugs) > 0 || opts.ManageHD || opts.HDCharacters || opts.HDCreatures || opts.Language != "" && opts.Language != "enUS" {
@@ -109,7 +113,6 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	}
 	appendSet(manifest.Data.Common.Files, true)
 	appendSet(game.Files, false)
-	result.Files = files
 	if len(files) == 0 {
 		return result, errors.New("no files found in manifest for game")
 	}
@@ -119,17 +122,73 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	if opts.Verify {
 		return u.verify(ctx, files, result, progress)
 	}
+	var markCachePending func() error
+	var installation *os.Root
 	if !opts.DryRun {
 		unlock, err := acquireFileLock(filepath.Join(u.root, installationLock))
 		if err != nil {
 			return result, fmt.Errorf("could not lock installation: %w", err)
 		}
 		defer unlock()
+		installation, err = openInstallation(u.root)
+		if err != nil {
+			return result, err
+		}
+		defer installation.Close()
+		if game.Slug != "roguelike" {
+			if _, err := installation.Lstat(ptrInstallMarker); !errors.Is(err, os.ErrNotExist) {
+				return result, errors.New("this folder needs its first PTR install; select the PTR profile before updating")
+			}
+		}
+		info, err := installation.Lstat(cachePendingName)
+		if err == nil && !info.Mode().IsRegular() {
+			return result, errors.New("unsafe pending cache marker")
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return result, fmt.Errorf("check pending cache refresh: %w", err)
+		}
+		cachePending := err == nil
+		markCachePending = sync.OnceValue(func() error {
+			if cachePending {
+				return nil
+			}
+			marker, err := installation.OpenFile(cachePendingName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if err != nil {
+				return fmt.Errorf("mark cache for refresh: %w", err)
+			}
+			cachePending = true
+			return marker.Close()
+		})
+		// Keep the pending marker across runs until refresh succeeds, even on a partial update.
+		defer func() {
+			if cachePending {
+				removed, err := clearCache(installation, progress)
+				result.RemovedPaths = append(result.RemovedPaths, removed...)
+				if err == nil {
+					err = installation.Remove(cachePendingName)
+				}
+				if err != nil {
+					runErr = errors.Join(runErr, fmt.Errorf("could not finish game cache refresh: %w", err))
+				}
+			}
+			if runErr == nil {
+				current, pathErr := os.Lstat(u.root)
+				pinned, statErr := installation.Stat(".")
+				if pathErr != nil || statErr != nil || !os.SameFile(current, pinned) {
+					runErr = errors.New("game folder changed during the update")
+				}
+			}
+			if runErr == nil && game.Slug == "roguelike" && !opts.Quick {
+				if err := installation.Remove(ptrInstallMarker); err != nil && !errors.Is(err, os.ErrNotExist) {
+					runErr = fmt.Errorf("could not mark PTR installed: %w", err)
+				}
+			}
+		}()
 	}
 
 	needed := make([]ManifestFile, 0, len(files))
 	for _, f := range files {
-		path, err := u.destination(f.Path, false)
+		path, err := u.destination(f.Path)
 		if err != nil {
 			return result, err
 		}
@@ -164,8 +223,7 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 	if opts.DryRun {
 		return result, nil
 	}
-
-	failed, newToken := u.downloadFiles(ctx, needed, result.Token, progress)
+	failed, newToken := u.downloadFiles(ctx, installation, needed, result.Token, markCachePending, progress)
 	result.Token = newToken
 	result.Downloaded = len(needed) - len(failed)
 	result.FilesUpdated = result.Downloaded > 0
@@ -173,23 +231,23 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 		result.FailedFiles = failed
 		return result, fileFailuresError("failed to download", failed)
 	}
-	changed := result.FilesUpdated
-	manifestPaths := make(map[string]bool, len(files))
-	for _, f := range files {
-		path, _ := u.destination(f.Path, false)
-		manifestPaths[path] = true
-	}
-	for _, f := range files {
-		path, _ := u.destination(f.Path, false)
-		for _, stale := range removeCaseVariants(path, manifestPaths) {
-			stale = u.relativePath(stale)
-			result.RemovedPaths = append(result.RemovedPaths, stale)
-			if progress != nil {
-				progress(Progress{Stage: "remove", Path: stale})
-			}
-			changed = true
-			result.FilesUpdated = true
+	if err := visitStaleCaseVariants(ctx, installation, files, func(dir *os.File, stale string) error {
+		if err := markCachePending(); err != nil {
+			return err
 		}
+		if err := unix.Unlinkat(int(dir.Fd()), filepath.Base(stale), 0); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("remove stale game file %s: %w", stale, err)
+		}
+		result.RemovedPaths = append(result.RemovedPaths, stale)
+		result.FilesUpdated = true
+		if progress != nil {
+			progress(Progress{Stage: "remove", Path: stale})
+		}
+		return nil
+	}); err != nil {
+		return result, err
 	}
 	if locale != "" {
 		if err := u.validateLocalePack(locale); err != nil {
@@ -203,32 +261,24 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 			if rel == "" {
 				continue
 			}
-			path, err := u.destination(rel, true)
+			updated, err := writeRealmlist(installation, rel, contents, markCachePending)
 			if err != nil {
 				return result, err
 			}
-			old, err := os.ReadFile(path)
-			if errors.Is(err, os.ErrNotExist) || (err == nil && !bytes.Equal(old, contents)) {
-				if err := writeAtomic(path, contents); err != nil {
-					return result, err
-				}
+			if updated {
 				result.RealmlistUpdated = true
-				changed = true
 				if progress != nil {
 					progress(Progress{Stage: "update", Path: rel})
 				}
-			} else if err != nil {
-				return result, err
 			}
 		}
 	}
 	if locale != "" {
-		updated, err := u.writeGameCVars([]gameCVar{{"locale", locale}}, false)
+		updated, err := writeGameCVars(installation, []gameCVar{{"locale", locale}}, false, markCachePending)
 		if err != nil {
 			return result, err
 		}
 		if updated {
-			changed = true
 			result.FilesUpdated = true
 			if progress != nil {
 				progress(Progress{Stage: "update", Path: "WTF/Config.wtf"})
@@ -236,26 +286,11 @@ func (u *Updater) Run(ctx context.Context, manifest Manifest, token string, opts
 		}
 	}
 	if opts.ManageHD && !opts.Full && !opts.Quick {
-		removed, err := u.disableHDPatches(options, selectedOptions, progress)
+		removed, err := disableHDPatches(installation, options, selectedOptions, markCachePending, progress)
 		result.RemovedPaths = append(result.RemovedPaths, removed...)
+		result.FilesUpdated = result.FilesUpdated || len(removed) > 0
 		if err != nil {
 			return result, err
-		}
-		if len(removed) > 0 {
-			changed = true
-			result.FilesUpdated = true
-		}
-	}
-	if changed {
-		removed, err := u.clearCache(progress)
-		result.RemovedPaths = append(result.RemovedPaths, removed...)
-		if err != nil {
-			return result, fmt.Errorf("updated files but could not clear cache: %w", err)
-		}
-	}
-	if game.Slug == "roguelike" && !opts.Quick {
-		if err := os.Remove(filepath.Join(u.root, ptrInstallMarker)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return result, fmt.Errorf("could not mark PTR installed: %w", err)
 		}
 	}
 	return result, nil
@@ -290,7 +325,7 @@ func (u *Updater) validateFiles(files []ManifestFile) error {
 		if err != nil {
 			return fmt.Errorf("unsafe manifest path %q", f.Path)
 		}
-		if _, err := u.destination(clean, false); err != nil {
+		if _, err := u.destination(clean); err != nil {
 			return err
 		}
 	}
@@ -314,8 +349,8 @@ func safeRelativePath(path string) (string, error) {
 	return clean, nil
 }
 
-// destination checks existing components with Lstat so symlinks cannot redirect writes outside root.
-func (u *Updater) destination(rel string, create bool) (string, error) {
+// destination validates a path for readers. Writes use pinned directory handles.
+func (u *Updater) destination(rel string) (string, error) {
 	clean, err := safeRelativePath(rel)
 	if err != nil {
 		return "", fmt.Errorf("unsafe destination %q", rel)
@@ -334,12 +369,6 @@ func (u *Updater) destination(rel string, create bool) (string, error) {
 	for i, part := range parts {
 		current = filepath.Join(current, part)
 		info, statErr := os.Lstat(current)
-		if errors.Is(statErr, os.ErrNotExist) && create && i < len(parts)-1 {
-			if err := os.Mkdir(current, 0755); err != nil && !errors.Is(err, os.ErrExist) {
-				return "", err
-			}
-			info, statErr = os.Lstat(current)
-		}
 		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 			return "", statErr
 		}
@@ -351,11 +380,18 @@ func (u *Updater) destination(rel string, create bool) (string, error) {
 }
 
 func fileMD5(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file: %s", path)
+	}
 	h := md5.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -365,17 +401,15 @@ func fileMD5(path string) (string, error) {
 
 func (u *Updater) verify(ctx context.Context, files []ManifestFile, result UpdateResult, progress ProgressFunc) (UpdateResult, error) {
 	var bad []FileFailure
-	manifestPaths := make(map[string]bool, len(files))
-	for _, f := range files {
-		path, _ := u.destination(f.Path, false)
-		manifestPaths[path] = true
-	}
 	for i, f := range files {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		path, _ := u.destination(f.Path, false)
-		got, err := fileMD5(path)
+		var got string
+		path, err := u.destination(f.Path)
+		if err == nil {
+			got, err = fileMD5(path)
+		}
 		want, _ := manifestMD5(f.Hash)
 		result.Checked++
 		var issue, detail string
@@ -391,11 +425,6 @@ func (u *Updater) verify(ctx context.Context, files []ManifestFile, result Updat
 			issue, detail = "mismatch", "checksum mismatch"
 		default:
 			result.Current++
-			if progress != nil {
-				for _, stale := range findCaseVariants(path, manifestPaths) {
-					progress(Progress{Stage: "stale", Message: "case-only stale file", Path: stale, Current: i + 1, Total: len(files)})
-				}
-			}
 		}
 		if issue != "" {
 			bad = append(bad, FileFailure{Path: f.Path, Reason: detail})
@@ -404,11 +433,24 @@ func (u *Updater) verify(ctx context.Context, files []ManifestFile, result Updat
 			progress(Progress{Stage: "verify", Path: f.Path, Current: i + 1, Total: len(files), Issue: issue, Message: detail})
 		}
 	}
+	var verifyErr error
 	if len(bad) != 0 {
 		result.FailedFiles = bad
-		return result, fileFailuresError("verification failed", bad)
+		verifyErr = fileFailuresError("verification failed", bad)
 	}
-	return result, nil
+	if progress != nil {
+		installation, err := openInstallation(u.root)
+		if err != nil {
+			return result, errors.Join(verifyErr, err)
+		}
+		defer installation.Close()
+		err = visitStaleCaseVariants(ctx, installation, files, func(_ *os.File, stale string) error {
+			progress(Progress{Stage: "stale", Message: "case-only stale file", Path: stale})
+			return nil
+		})
+		return result, errors.Join(verifyErr, err)
+	}
+	return result, verifyErr
 }
 
 func fileFailuresError(summary string, failed []FileFailure) error {
@@ -440,11 +482,6 @@ func downloadCause(err error) string {
 	return err.Error()
 }
 
-func isAuthError(err error) bool {
-	var httpErr *HTTPError
-	return errors.As(err, &httpErr) && (httpErr.StatusCode == 401 || httpErr.StatusCode == 403)
-}
-
 type downloadJob struct {
 	file ManifestFile
 	url  string
@@ -462,7 +499,7 @@ func (u *Updater) downloadLink(ctx context.Context, token string, f ManifestFile
 	return downloadJob{file: f, url: raw}, err
 }
 
-func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token string, progress ProgressFunc) ([]FileFailure, string) {
+func (u *Updater) downloadFiles(ctx context.Context, installation *os.Root, files []ManifestFile, token string, beforeWrite func() error, progress ProgressFunc) ([]FileFailure, string) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	results := make(chan downloadResult, len(files))
@@ -488,7 +525,7 @@ func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token
 		switch {
 		case r.err == nil:
 			downloadJobs = append(downloadJobs, r.job)
-		case isAuthError(r.err):
+		case unauthorized(r.err):
 			authJobs = append(authJobs, r)
 		default:
 			failLink(r.job.file.Path, r.err)
@@ -522,7 +559,7 @@ func (u *Updater) downloadFiles(ctx context.Context, files []ManifestFile, token
 			}
 		}
 	}
-	failed = append(failed, u.transfer(ctx, downloadJobs, progress)...)
+	failed = append(failed, u.transfer(ctx, installation, downloadJobs, beforeWrite, progress)...)
 	slices.SortFunc(failed, func(a, b FileFailure) int { return strings.Compare(a.Path, b.Path) })
 	return failed, token
 }
@@ -535,7 +572,7 @@ func validHTTPS(raw string) error {
 	return nil
 }
 
-func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress ProgressFunc) []FileFailure {
+func (u *Updater) transfer(ctx context.Context, installation *os.Root, jobs []downloadJob, beforeWrite func() error, progress ProgressFunc) []FileFailure {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	var mu sync.Mutex
@@ -548,11 +585,14 @@ func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress Pro
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			path, err := u.destination(job.file.Path, true)
+			parent := filepath.Dir(job.file.Path)
+			dir, err := openUpdateDir(installation, parent, unix.O_PATH, true)
 			if err == nil {
+				defer dir.Close()
 				for attempt := 0; attempt < 3; attempt++ {
-					err = downloadAtomic(ctx, u.api, job.url, path, job.file.Hash)
+					err = downloadAtomic(ctx, u.api, job.url, dir, filepath.Base(job.file.Path), job.file.Hash, beforeWrite)
 					if err == nil {
+						err = checkUpdateDirectory(installation, parent, dir)
 						break
 					}
 				}
@@ -574,7 +614,7 @@ func (u *Updater) transfer(ctx context.Context, jobs []downloadJob, progress Pro
 	return failed
 }
 
-func downloadAtomic(ctx context.Context, api API, rawURL, target, encodedHash string) error {
+func downloadAtomic(ctx context.Context, api API, rawURL string, dir *os.File, name, encodedHash string, beforeWrite func() error) error {
 	if err := validHTTPS(rawURL); err != nil {
 		return err
 	}
@@ -582,127 +622,108 @@ func downloadAtomic(ctx context.Context, api API, rawURL, target, encodedHash st
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".launcher-*.tmp")
+	return commitUpdateFile(dir, name, func(dst io.Writer) error {
+		hash := md5.New()
+		if err := api.Download(ctx, rawURL, io.MultiWriter(dst, hash)); err != nil {
+			return err
+		}
+		if hex.EncodeToString(hash.Sum(nil)) != want {
+			return errors.New("download checksum mismatch")
+		}
+		return nil
+	}, beforeWrite)
+}
+
+func writeRealmlist(root *os.Root, rel string, contents []byte, beforeWrite func() error) (bool, error) {
+	dir, err := openUpdateDir(root, filepath.Dir(rel), unix.O_PATH, true)
+	if err != nil {
+		return false, err
+	}
+	defer dir.Close()
+	name := filepath.Base(rel)
+	old, err := readUpdateBytes(dir, name)
+	if err == nil && bytes.Equal(old, contents) {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if err := writeUpdateBytes(dir, name, contents, beforeWrite); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func clearCache(installation *os.Root, progress ProgressFunc) ([]string, error) {
+	cache, err := openUpdateDir(installation, "Cache", os.O_RDONLY, true)
+	if err != nil {
+		return nil, err
+	}
+	defer cache.Close()
+	var removed []string
+	if err := removeCacheFiles(cache, "Cache", &removed, progress); err != nil {
+		return removed, err
+	}
+	fd, err := unix.Openat(int(cache.Fd()), "invalid", os.O_CREATE|os.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0644)
+	if err != nil {
+		return removed, &os.PathError{Op: "write cache marker", Path: "Cache/invalid", Err: err}
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return removed, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return removed, errors.New("unsafe game cache marker")
+	}
+	return removed, nil
+}
+
+func removeCacheFiles(dir *os.File, relative string, removed *[]string, progress ProgressFunc) error {
+	names, err := dir.Readdirnames(-1)
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	err = api.Download(ctx, rawURL, tmp)
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	got, err := fileMD5(name)
-	if err != nil {
-		return err
-	}
-	if got != want {
-		return errors.New("download checksum mismatch")
-	}
-	if err := os.Rename(name, target); err != nil {
-		return err
+	slices.Sort(names)
+	parent := int(dir.Fd())
+	for _, name := range names {
+		path := filepath.Join(relative, name)
+		var entry unix.Stat_t
+		if err := unix.Fstatat(parent, name, &entry, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return &os.PathError{Op: "inspect game cache", Path: path, Err: err}
+		}
+		switch entry.Mode & unix.S_IFMT {
+		case unix.S_IFDIR:
+			fd, err := unix.Openat(parent, name, updateDirectoryFlags|unix.O_CLOEXEC, 0)
+			if err != nil {
+				return &os.PathError{Op: "open game cache", Path: path, Err: err}
+			}
+			child := os.NewFile(uintptr(fd), path)
+			err = removeCacheFiles(child, path, removed, progress)
+			child.Close()
+			if err != nil {
+				return err
+			}
+		case unix.S_IFREG:
+			if !strings.EqualFold(filepath.Ext(name), ".wdb") {
+				continue
+			}
+			if err := unix.Unlinkat(parent, name, 0); errors.Is(err, os.ErrNotExist) {
+				continue
+			} else if err != nil {
+				return &os.PathError{Op: "remove cached game data", Path: path, Err: err}
+			}
+			*removed = append(*removed, path)
+			if progress != nil {
+				progress(Progress{Stage: "remove", Path: path})
+			}
+		}
 	}
 	return nil
 }
 
-func findCaseVariants(target string, manifestPaths map[string]bool) []string {
-	entries, err := os.ReadDir(filepath.Dir(target))
-	if err != nil {
-		return nil
-	}
-	base := filepath.Base(target)
-	var variants []string
-	for _, entry := range entries {
-		variant := filepath.Join(filepath.Dir(target), entry.Name())
-		if entry.Name() != base && strings.EqualFold(entry.Name(), base) && entry.Type().IsRegular() && !manifestPaths[variant] {
-			variants = append(variants, variant)
-		}
-	}
-	return variants
-}
-
-func removeCaseVariants(target string, manifestPaths map[string]bool) []string {
-	var removed []string
-	for _, variant := range findCaseVariants(target, manifestPaths) {
-		if err := os.Remove(variant); err == nil {
-			removed = append(removed, variant)
-		}
-	}
-	return removed
-}
-
-func writeAtomic(target string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".launcher-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, target)
-}
-
-func (u *Updater) relativePath(path string) string {
-	relative, err := filepath.Rel(u.root, path)
-	if err != nil {
-		return filepath.ToSlash(path)
-	}
-	return filepath.ToSlash(relative)
-}
-
-func (u *Updater) clearCache(progress ProgressFunc) ([]string, error) {
-	path, err := u.destination("Cache", true)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(path, 0755); err != nil {
-		return nil, err
-	}
-	var removed []string
-	if err := filepath.WalkDir(path, func(cachePath string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".wdb") {
-			return nil
-		}
-		if err := os.Remove(cachePath); err != nil {
-			return err
-		}
-		relative := u.relativePath(cachePath)
-		removed = append(removed, relative)
-		if progress != nil {
-			progress(Progress{Stage: "remove", Path: relative})
-		}
-		return nil
-	}); err != nil {
-		return removed, err
-	}
-	invalid, err := u.destination("Cache/invalid", true)
-	if err != nil {
-		return removed, err
-	}
-	f, err := os.OpenFile(invalid, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return removed, err
-	}
-	if err := f.Close(); err != nil {
-		return removed, err
-	}
-	return removed, nil
-}
 func AvailableGameOptions(manifest Manifest, gameSlug string) []GameOption {
 	bySlug := make(map[string]*GameOption)
 	add := func(file ManifestFile) {
@@ -763,7 +784,7 @@ func hasGameOption(options []GameOption, kind string) bool {
 
 func (u *Updater) validateLocalePack(locale string) error {
 	rel := filepath.Join("Data", locale)
-	path, err := u.destination(rel, false)
+	path, err := u.destination(rel)
 	if err != nil {
 		return err
 	}
@@ -777,52 +798,4 @@ func (u *Updater) validateLocalePack(locale string) error {
 		}
 	}
 	return fmt.Errorf("no game language files (*.MPQ) found under %s", rel)
-}
-
-func (u *Updater) disableHDPatches(options []GameOption, enabled map[string]bool, progress ProgressFunc) ([]string, error) {
-	var backup string
-	var removed []string
-	for _, option := range options {
-		if enabled[option.Slug] || option.Kind != "hd-characters" && option.Kind != "hd-creatures" {
-			continue
-		}
-		for _, rel := range option.Paths {
-			if !strings.EqualFold(rel, "Data/patch-H.MPQ") && !strings.EqualFold(rel, "Data/patch-G.MPQ") {
-				continue
-			}
-			path, err := u.destination(rel, false)
-			if err != nil {
-				return removed, err
-			}
-			candidates := findCaseVariants(path, nil)
-			candidates = append(candidates, path)
-			for _, candidate := range candidates {
-				info, err := os.Lstat(candidate)
-				if errors.Is(err, os.ErrNotExist) {
-					continue
-				}
-				if err != nil {
-					return removed, err
-				}
-				if !info.Mode().IsRegular() {
-					return removed, fmt.Errorf("cannot disable unsafe HD file %s", u.relativePath(candidate))
-				}
-				if backup == "" {
-					backup, err = os.MkdirTemp(u.root, ".ebonhold-disabled-hd-")
-					if err != nil {
-						return removed, fmt.Errorf("could not create HD patch backup: %w", err)
-					}
-				}
-				savedPath := filepath.Join(backup, filepath.Base(candidate))
-				if err := os.Rename(candidate, savedPath); err != nil {
-					return removed, fmt.Errorf("could not move %s to HD patch backup: %w", u.relativePath(candidate), err)
-				}
-				removed = append(removed, u.relativePath(candidate))
-				if progress != nil {
-					progress(Progress{Stage: "remove", Path: u.relativePath(candidate), Message: "HD patch backed up to " + u.relativePath(savedPath)})
-				}
-			}
-		}
-	}
-	return removed, nil
 }

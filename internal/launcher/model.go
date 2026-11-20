@@ -85,7 +85,7 @@ type AddonDownload struct {
 }
 
 type LoginPrompt interface {
-	PromptLogin(context.Context, string, bool) (username, password string, remember bool, err error)
+	PromptLogin(context.Context) (username, password string, err error)
 }
 
 type Progress struct {
@@ -95,15 +95,9 @@ type Progress struct {
 	Current int
 	Issue   string // Verification result: "missing", "mismatch", or "unreadable".
 	Total   int
-	Bytes   int64
 }
 
 type ProgressFunc func(Progress)
-type Credentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
 type CredentialStore struct {
 	Root string
 }
@@ -122,7 +116,6 @@ type UpdateOptions struct {
 	Full         bool
 	Verify       bool
 	DryRun       bool
-	Quiet        bool
 	Language     string
 	ManageHD     bool
 	HDCharacters bool
@@ -143,8 +136,6 @@ type FileFailure struct {
 }
 
 type UpdateResult struct {
-	Game             Game
-	Files            []ManifestFile
 	Token            string
 	Checked          int
 	Current          int
@@ -156,5 +147,4 @@ type UpdateResult struct {
 	RealmlistUpdated bool
 	PlannedPaths     []string
 	RemovedPaths     []string
-	BytesAfter       int64
 }

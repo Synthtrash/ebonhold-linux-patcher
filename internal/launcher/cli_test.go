@@ -64,13 +64,23 @@ func TestParseArgsRejectsInvalidModeCombinations(t *testing.T) {
 	}
 }
 
+func TestRunCLIVersionDoesNotNeedGameFolderOrConnection(t *testing.T) {
+	var stdout, stderr strings.Builder
+	console := NewConsole(strings.NewReader(""), &stdout, &stderr, false, false)
+	args := []string{"--client-dir=" + filepath.Join(t.TempDir(), "not installed"), "--version"}
+	if err := RunCLI(context.Background(), nil, "", args, console); err != nil {
+		t.Fatal(err)
+	}
+	if out := stdout.String(); out != "ebonhold-launcher "+BuildVersion()+"\n" || stderr.Len() != 0 {
+		t.Fatalf("version = %q, stderr = %q", out, stderr.String())
+	}
+}
+
 func TestRunCLITargetsSelectedClientFolder(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	t.Setenv("TMPDIR", t.TempDir())
 	clientRoot := t.TempDir()
-	if err := (&CredentialStore{Root: clientRoot}).saveToken("client-token"); err != nil {
-		t.Fatal(err)
-	}
+	seedToken(t, clientRoot, "client-token")
 	launcherRoot := t.TempDir()
 	api := &authFake{gamesErr: map[string]error{}}
 	var stdout, stderr strings.Builder
@@ -146,13 +156,37 @@ func TestRunGamePreservesChildExitStatus(t *testing.T) {
 	}
 }
 
+func TestRunCLIVerifyNamesStaleFilesWithoutRemovingThem(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := t.TempDir()
+	seedToken(t, root, "token")
+	const canonical, stale = "Data/Patch-A.MPQ", "Data/patch-a.MPQ"
+	data := []byte("patch")
+	mustWrite(t, filepath.Join(root, canonical), data)
+	mustWrite(t, filepath.Join(root, stale), []byte("old patch"))
+	api := &cliManifestAPI{
+		updaterAPI: &updaterAPI{},
+		manifest:   manifest(nil, Game{Slug: "roguelike-prod", Files: []ManifestFile{file("1", canonical, data, nil)}}),
+	}
+	var stdout, stderr strings.Builder
+	console := NewConsole(strings.NewReader(""), &stdout, &stderr, false, false)
+	if err := RunCLI(t.Context(), api, root, []string{"--verify", "--quiet"}, console); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), stale) || strings.Contains(stdout.String(), canonical) {
+		t.Fatalf("quiet verification stdout=%q, stderr=%q", stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, stale)); err != nil {
+		t.Fatalf("verification removed stale file: %v", err)
+	}
+}
+
 func TestRunCLIFailedQuickUpdateDoesNotLaunchGame(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	root := t.TempDir()
-	if err := (&CredentialStore{Root: root}).saveToken("token"); err != nil {
-		t.Fatal(err)
-	}
+	seedToken(t, root, "token")
 	common := file("1", "common.dat", []byte("common"), nil)
 	dll := file("2", "Data/game.dll", []byte("dll"), nil)
 	api := &cliManifestAPI{
@@ -181,9 +215,9 @@ func TestRunCLIUpdatesPTRBeforeLaunching(t *testing.T) {
 	const realmPath = "Data/enUS/realmlist.wtf"
 	mustWrite(t, filepath.Join(production, dllPath), []byte("production DLL"))
 	mustWrite(t, filepath.Join(production, realmPath), []byte("set realmlist prod.example\n"))
-	if err := (&CredentialStore{Root: ptr}).saveToken("ptr-session"); err != nil {
-		t.Fatal(err)
-	}
+	mustWrite(t, filepath.Join(ptr, ptrInstallMarker), nil)
+	mustWrite(t, filepath.Join(ptr, dllPath), []byte("original copy"))
+	seedToken(t, ptr, "ptr-session")
 	dll := []byte("PTR DLL")
 	api := &cliManifestAPI{
 		updaterAPI: &updaterAPI{data: map[string][]byte{"2": dll}, urlCalls: map[string]int{}},
@@ -198,6 +232,13 @@ func TestRunCLIUpdatesPTRBeforeLaunching(t *testing.T) {
 		printf 'PTR client started\n'`
 	var stdout, stderr strings.Builder
 	console := NewConsole(strings.NewReader(""), &stdout, &stderr, false, false)
+	wrong := []string{"--client-dir=" + ptr, "--", "sh", "-c", "echo wrongly launched"}
+	if err := RunCLI(t.Context(), api, production, wrong, console); err == nil || !strings.Contains(err.Error(), "--game=roguelike") {
+		t.Fatalf("default profile did not reject the new copy: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(ptr, dllPath)); err != nil || string(got) != "original copy" || strings.Contains(stdout.String(), "wrongly launched") {
+		t.Fatalf("rejected launch still changed or ran the client: %q, %v", got, err)
+	}
 	args := []string{"--game=roguelike", "--client-dir=" + ptr, "--", "sh", "-c", checkClient, "game", ptr}
 	if err := RunCLI(t.Context(), api, production, args, console); err != nil {
 		t.Fatalf("PTR launch: %v\n%s%s", err, stdout.String(), stderr.String())
@@ -240,9 +281,7 @@ func TestRunCLIRejectsMismatchedSavedRealm(t *testing.T) {
 			path := filepath.Join(tc.root, dll)
 			starting := "old " + tc.contents
 			mustWrite(t, path, []byte(starting))
-			if err := (&CredentialStore{Root: tc.root}).saveToken("fixture-token"); err != nil {
-				t.Fatal(err)
-			}
+			seedToken(t, tc.root, "fixture-token")
 			api := &cliManifestAPI{
 				updaterAPI: &updaterAPI{
 					data:     map[string][]byte{"1": []byte("Production DLL"), "2": []byte("PTR DLL")},

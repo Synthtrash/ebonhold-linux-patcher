@@ -125,6 +125,53 @@ func TestHTTPAPIDoesNotFollowRedirectToHTTP(t *testing.T) {
 	}
 }
 
+func TestHTTPAPIRedirectPolicyKeepsCredentialsOnOrigin(t *testing.T) {
+	check := NewDefaultAPI().client.CheckRedirect
+	login, err := http.NewRequest(http.MethodPost, defaultAPIBase+"/api/auth/login", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodGet, defaultAPIBase+"/api/launcher/games", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer test-token")
+	for _, initial := range []*http.Request{login, request} {
+		for _, destination := range []string{"https://api.project-ebonhold.com:443", "https://cdn.example.test", "https://api.project-ebonhold.com:8443"} {
+			next, err := http.NewRequest(http.MethodGet, destination, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			allowed := next.URL.Host == "api.project-ebonhold.com:443"
+			if err := check(next, []*http.Request{initial}); (err == nil) != allowed {
+				t.Errorf("%s redirect to %s: allowed = %t, want %t", initial.Method, destination, err == nil, allowed)
+			}
+		}
+	}
+}
+
+func TestHTTPAPIFollowsHTTPSDownloadRedirect(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Referer() != "" {
+			t.Error("download redirect sent an unsolicited Referer")
+		}
+		_, _ = io.WriteString(w, "downloaded patch")
+	}))
+	defer target.Close()
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+	api, err := NewHTTPAPI(source.URL, source.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst strings.Builder
+	if err := api.Download(context.Background(), source.URL+"?preview=test", &dst); err != nil || dst.String() != "downloaded patch" {
+		t.Fatalf("redirected download = %q, %v", dst.String(), err)
+	}
+}
+
 func TestHTTPAPIReportsTruncatedDownload(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "64")
