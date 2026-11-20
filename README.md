@@ -27,11 +27,17 @@ Optional: check the archive with `sha256sum -c` followed by the name of its matc
 
 ## First setup
 
-1. Open **Setup** and choose the game profile that matches your existing files. Use **Search common locations**, or choose the folder containing `Wow.exe` and `Data/`. Use a separate folder for each profile.
-2. Under **How to launch**, pick the app you already use for Ebonhold. Choose your existing bottle in Bottles, or your game shortcut in Steam or Lutris. If you only want the updater, choose **Start the game myself**.
-3. On **Home**, use the install button first if you created a separate copy in Setup. Choose **Play** if you set up a launch app. If you chose **Start the game myself**, use **Update files** when a patch is out, then start the game from your usual app.
+1. Open **Setup**. If you need the game files, choose **I need to install it**. If you already have Ebonhold, let the launcher look for it, or choose `Wow.exe` or the folder containing it and `Data/`. Use a separate folder for each profile.
+2. Under **How to launch**, choose the app you already use. Pick your existing Bottles bottle or a matching Steam or Lutris shortcut. If there is one matching shortcut, the launcher suggests it. Use **Advanced** only if you need to enter an ID. If you only want the updater, choose **Start the game myself**.
+3. On **Next steps**, use **Test launch** to see whether the game opens without a launcher update. Then use **Play** on Home. If you chose **Start the game myself**, update here and start the game from your usual app.
+
+Drag the title bar to move the folder or file picker inside the launcher. On small displays, the launcher uses smaller text without changing your desktop settings. If Home is narrow, scroll past the controls to see the news. Setup keeps its buttons visible while you scroll.
 
 Steam needs a non-Steam shortcut pointing to that folder's `Wow.exe`. The launcher won't edit your Steam, Lutris, or Bottles settings. If you move the game, choose its launch target again in **Setup**.
+
+If you create a separate copy in Setup, **Check space** shows the destination, estimated copy size, and free space before copying. An activity bar stays visible while the launcher checks space or copies files. Keep the launcher open until the copy is ready, then use the install button on Home before playing it.
+
+If you move or delete a test copy, reopen **Setup** on that profile. **Create PTR copy** offers the previous path if it is free, or you can choose an existing folder.
 
 ## Using the launcher
 
@@ -40,11 +46,15 @@ Steam needs a non-Steam shortcut pointing to that folder's `Wow.exe`. The launch
 - Run `--version` to identify the build when reporting a problem. **Copy details** includes the same version.
 - **Add-ons** shows what you can install or update. Removal only affects add-ons installed by this launcher and moves them to a backup.
 - **News** shows the latest posts from Project Ebonhold. No sign-in needed.
+- **Player Guide** under **Latest news** on Home opens the gameplay guide in your browser.
 - In **Settings**, you can make **Play** check for updates first, choose the launcher language, or pick game language and HD patches for the next update. Enter Bottles launch arguments one per line, without quotes. Set Steam or Lutris launch arguments in those apps.
+- **Settings → Launch → Add to Applications** puts Ebonhold Linux Launcher in your app menu without `sudo`. If you move the executable, run it from its new location and add the shortcut again.
 
 ## When the game won't open
 
-If you see **Could not launch game**, use **Copy details** for the launch error. If Wine says it can't open the X11 display, save your work and try signing out of your Linux desktop and back in before retrying. The game may need XWayland even when the launcher itself opens on Wayland.
+Open **Troubleshoot** on Home or in Setup. Start by trying the same `Wow.exe` in your usual game app. The launcher can point you to Steam compatibility settings, Flatpak folder access, Microsoft Visual C++ downloads, or display fixes. It won't install a runtime or change Flatpak permissions.
+
+If a launch fails, **Copy details** shares the launcher version, Linux distribution, display session, game app, and detected issue when available. It excludes paths, credentials, and raw launch output. Use **View local output** to inspect the full captured message and check it for private information before sharing.
 
 If the game opens but has black bars or clicks land in the wrong place, close WoW. Open **Settings → Launch → Game CVars**, select **Load windowed preset**, and choose **Apply**. This changes the game's display settings, not how Wine connects to your desktop. To undo it, close WoW and restore `WTF/Config.wtf.before-launcher-cvars` as `WTF/Config.wtf`.
 
@@ -100,7 +110,9 @@ Keep any game arguments after a second `--`, following the `Wow.exe` path. If yo
 
 ## Sign-in and local files
 
-The launcher saves a session token in `.updaterToken`, not your password. If the token expires, sign in again.
+Launcher sign-in is for updates and add-ons. The launcher saves a session token in `.updaterToken`, not your password. WoW has its own login screen, so sign in there separately. If the launcher token expires, sign in to the launcher again.
+
+To save only your account name, select **Remember Account Name** in WoW. Anyone who can read the game folder can see the name, so leave it off on shared computers. To clear the name, uncheck it and sign in to WoW again.
 
 The desktop launcher removes old `.ebonhold-login/credentials.json` files from valid saved game folders and when you confirm a folder in Setup. It warns if it can't check a saved folder or safely remove an old password. The command line checks for the file before reusing your token, including when reporting status or add-ons. Verify and dry-run leave it alone.
 
@@ -123,3 +135,15 @@ Pass a version as the second argument to label both archives, for example `./scr
 The release workflow packages both versions on Ubuntu 22.04. Building on a newer distro can produce executables that won't run on older systems.
 
 The launcher is [MIT licensed](LICENSE). The release archives include third-party notices.
+
+### Check the profile isolation proof
+
+[Lean 4](https://lean-lang.org/install/manual/) checks a model of the game folders: switching profiles leaves both folders intact, and folder edits cannot make them overlap. The Go test checks the launcher's folder selection and validation against cases generated by the model. It does not prove the Go code or model filesystem aliases such as symlinks.
+
+Use Lean on `PATH` with the version pinned in `internal/launcher/testdata/proofs/lean-toolchain`. If you use Elan, install that toolchain first. Then run:
+
+```sh
+go test -tags leanproof ./internal/launcher -run '^TestProfileIsolationProof$' -count=1 -v
+```
+
+Lean is only needed for this check, not to build or run the launcher.

@@ -2,7 +2,6 @@ package ui
 
 import (
 	"image/color"
-	"net/url"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -14,7 +13,7 @@ import (
 	"github.com/synthtrash/ebonhold-linux-patcher/internal/launcher"
 )
 
-func showSettings(w fyne.Window, tr translate, profileName, launcherLang, manager string, game launcher.GameSettings, applyCVars func(string) (bool, error), save func(launcher.GameSettings, string)) {
+func showSettings(w fyne.Window, tr translate, profileName, launcherLang, manager string, game launcher.GameSettings, applyCVars func(string) (bool, error), addToApplications func() error, save func(launcher.GameSettings, string)) {
 	unchanged := tr("Leave unchanged")
 	gameLocales := map[string]string{"English": "enUS", "Français": "frFR", "Español": "esES", "Deutsch": "deDE"}
 	gameLanguage := widget.NewSelect([]string{unchanged, "English", "Français", "Español", "Deutsch"}, nil)
@@ -43,7 +42,6 @@ func showSettings(w fyne.Window, tr translate, profileName, launcherLang, manage
 	}
 	gameNotice := widget.NewLabel(tr("Game language and HD changes apply when you update. The realm's official language and support are English."))
 	gameNotice.Wrapping = fyne.TextWrapWord
-	installGuide := widget.NewHyperlink(tr("Ebonhold Installation Guide"), &url.URL{Scheme: "https", Host: "project-ebonhold.com", Path: "/support/installation-guide"})
 	updateBeforePlay := widget.NewCheck(tr("Check for updates before Play"), nil)
 	updateBeforePlay.SetChecked(game.UpdateBeforePlay)
 	editCVars := widget.NewButton(tr("Game CVars…"), func() { showGameCVars(w, tr, profileName, applyCVars) })
@@ -63,12 +61,21 @@ func showSettings(w fyne.Window, tr translate, profileName, launcherLang, manage
 		note.Wrapping = fyne.TextWrapWord
 		launch.Add(note)
 	}
+	addShortcut := widget.NewButton(tr("Add to Applications"), func() {
+		if err := addToApplications(); err != nil {
+			dialog.ShowInformation(tr("Could not add to Applications"), tr(err.Error()), w)
+			return
+		}
+		dialog.ShowInformation(tr("Added to Applications"), tr("Find Ebonhold Linux Launcher in your app menu. Keep the launcher file in its current folder."), w)
+	})
+	launch.Add(widget.NewSeparator())
+	launch.Add(container.NewHBox(addShortcut))
 	gameOptions := container.NewVBox(
 		container.New(layout.NewFormLayout(), widget.NewLabel(tr("Game language")), gameLanguage),
 		manageHD,
 		container.NewHBox(hdCharacters, hdCreatures),
 		gameNotice,
-		installGuide,
+		installationGuideLink(tr),
 	)
 	pages := [...]fyne.CanvasObject{launch, gameOptions}
 	page := container.NewStack(pages[0])

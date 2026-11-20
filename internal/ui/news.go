@@ -13,7 +13,7 @@ import (
 	"github.com/synthtrash/ebonhold-linux-patcher/internal/launcher"
 )
 
-func newNewsView(ctx context.Context, tr translate, fetch func(context.Context) ([]launcher.NewsArticle, error), showNews func()) (tab, preview fyne.CanvasObject, load func()) {
+func newNewsView(ctx context.Context, tr translate, fetch func(context.Context) ([]launcher.NewsArticle, error), showNews, previewChanged func()) (tab, preview fyne.CanvasObject, load func()) {
 	site := url.URL{Scheme: "https", Host: "project-ebonhold.com", Path: "/news"}
 	allNews := widget.NewHyperlink(tr("On the Ebonhold website"), &site)
 	title := canvas.NewText(tr("Project Ebonhold news"), hexColor(colorText))
@@ -34,7 +34,8 @@ func newNewsView(ctx context.Context, tr translate, fetch func(context.Context) 
 	viewAll := widget.NewButton(tr("All news"), showNews)
 	viewAll.Importance = widget.LowImportance
 	previewHeader := container.NewBorder(nil, nil, nil, viewAll, container.NewHBox(container.NewCenter(previewTitle)))
-	previewPanel := container.NewVBox(previewHeader, previewStatusRow, previewEntries)
+	playerGuide := widget.NewHyperlink(tr("Player Guide"), &url.URL{Scheme: "https", Host: "www.project-ebonhold.com", Path: "/support/player-guide-v2"})
+	previewPanel := container.NewVBox(previewHeader, previewStatusRow, previewEntries, widget.NewSeparator(), container.NewHBox(flushText(playerGuide)))
 	setStatus := func(text string) {
 		status.SetText(text)
 		status.Show()
@@ -42,6 +43,7 @@ func newNewsView(ctx context.Context, tr translate, fetch func(context.Context) 
 			previewStatus.SetText(text)
 			previewStatusRow.Show()
 			previewPanel.Refresh()
+			previewChanged()
 		}
 	}
 	entries := container.NewVBox()
@@ -112,6 +114,7 @@ func newNewsView(ctx context.Context, tr translate, fetch func(context.Context) 
 				}
 				previewEntries.Refresh()
 				previewPanel.Refresh()
+				previewChanged()
 			})
 		}()
 	}

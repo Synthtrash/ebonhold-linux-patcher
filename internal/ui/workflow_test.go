@@ -62,6 +62,7 @@ case "$1" in
 run)
     if [ "${LAUNCH_TEST_NO_DISPLAY:-}" = "1" ]; then
         printf '\033[31m%s\033[0m\n' '011c:err:winediag:nodrv_CreateWindow L"Make sure that your X server is running and that $DISPLAY is set correctly."' >&2
+        printf '%s\n' 'game path=/home/private/secret token=private-fixture' >&2
         exit 0
     fi
     {
@@ -86,7 +87,12 @@ esac
 		Slug: "roguelike-prod", Files: []launcher.ManifestFile{{ID: "1", Path: patch, Hash: base64.StdEncoding.EncodeToString(hash[:])}},
 	}}}}
 	ticks := make(chan time.Time, 1)
-	w, driver, root := openTestWindowWithToken(t, api, ticks, api.token, nil)
+	w, driver, root := openTestWindowWithToken(t, api, ticks, api.token, func(context.Context) ([]launcher.NewsArticle, error) {
+		return []launcher.NewsArticle{
+			{ID: 2, Title: "Realm update"},
+			{ID: 1, Title: "Release notes"},
+		}, nil
+	})
 	driver.until(t, "Home launch action after sign-in", func() bool {
 		_, found := findControl(w.Content(), func(button *widget.Button) bool { return button.Text == "Set up launch" })
 		return found
@@ -177,8 +183,19 @@ esac
 		_, found := findControl(w.Content(), func(button *widget.Button) bool { return button.Text == "Sign in" })
 		return found
 	})
-	tapButton(t, w.Content(), "Play")
+	driver.until(t, "both Home news headlines loaded", func() bool {
+		_, found := findControl(w.Content(), func(link *widget.Hyperlink) bool { return link.Text == "Release notes" })
+		return found
+	})
+	desktopSize := w.Canvas().Size()
+	w.Resize(fyne.NewSize(710, 382))
+	play, ok := findControl(w.Content(), func(button *widget.Button) bool { return button.Text == "Play" })
+	if !ok {
+		t.Fatal("Play is missing on Home")
+	}
+	test.TapCanvas(w.Canvas(), driver.AbsolutePositionForObject(play).AddXY(play.Size().Width/2, play.Size().Height/2))
 	expectLaunch("patch missing")
+	w.Resize(desktopSize)
 	if got := api.manifestRequests.Load(); got != 0 {
 		t.Fatalf("Play made %d manifest requests with update checks off", got)
 	}
@@ -186,12 +203,25 @@ esac
 	t.Setenv("LAUNCH_TEST_NO_DISPLAY", "1")
 	tapButton(t, w.Content(), "Play")
 	driver.until(t, "Wine launch failure even though Bottles returned zero", func() bool {
-		_, found := findControl(w.Canvas().Overlays().Top(), func(entry *widget.Entry) bool {
-			return strings.Contains(entry.Text, "Wine could not open the X11 display") &&
-				strings.Contains(entry.Text, "nodrv_CreateWindow") && !strings.ContainsRune(entry.Text, '\x1b')
+		_, found := findControl(w.Canvas().Overlays().Top(), func(label *widget.Label) bool {
+			return label.Text == "Wine could not open the X11 display."
 		})
 		return found
 	})
+	tapButton(t, w.Canvas().Overlays().Top(), "Copy details")
+	details := w.Clipboard().Content()
+	if !strings.Contains(details, "Wine could not open the X11 display.") ||
+		!strings.Contains(details, "Desktop session:") || !strings.Contains(details, "Game app: Bottles (native)") ||
+		strings.Contains(details, "/home/private/secret") || strings.Contains(details, "private-fixture") || strings.Contains(details, "nodrv_CreateWindow") {
+		t.Fatal("copied launch details are incomplete or included private log output")
+	}
+	tapButton(t, w.Canvas().Overlays().Top(), "View local output")
+	if _, found := findControl(w.Canvas().Overlays().Top(), func(entry *widget.Entry) bool {
+		return strings.Contains(entry.Text, "nodrv_CreateWindow") && !strings.ContainsRune(entry.Text, '\x1b')
+	}); !found {
+		t.Fatal("local launch output is missing or retains terminal escapes")
+	}
+	tapButton(t, w.Canvas().Overlays().Top(), "Close")
 	tapButton(t, w.Canvas().Overlays().Top(), "Close")
 	t.Setenv("LAUNCH_TEST_NO_DISPLAY", "")
 
@@ -211,6 +241,15 @@ esac
 	}
 	test.Tap(check)
 	tapButton(t, settings, "Save")
+	tapButton(t, w.Content(), "Setup")
+	tapButton(t, w.Content(), "Continue")
+	tapButton(t, w.Content(), "Continue")
+	tapButton(t, w.Content(), "Test launch")
+	expectLaunch("patch missing")
+	if got := api.manifestRequests.Load(); got != 0 {
+		t.Fatalf("Test launch made %d manifest requests with update-before-Play enabled", got)
+	}
+	tapButton(t, w.Content(), "Go to Home")
 	tapButton(t, w.Content(), "Play")
 	driver.until(t, "update and launch handoff", func() bool {
 		_, found := findControl(w.Content(), func(label *widget.Label) bool {
@@ -255,6 +294,100 @@ func TestManualPTRSetupPointsToInstall(t *testing.T) {
 	}
 	tapButton(t, w.Content(), "Go to Home")
 	driver.until(t, "enabled Install PTR action", func() bool {
+		install, ok := findControl(w.Content(), func(b *widget.Button) bool { return b.Text == "Install PTR" })
+		return ok && !install.Disabled()
+	})
+}
+
+func TestPTRCopyRecreatesDeletedFolderAndShowsProgress(t *testing.T) {
+	const token = "fixture-session"
+	ticks := make(chan time.Time, 1)
+	w, driver, production := openTestWindowWithToken(t, &windowTestAPI{statusTestAPI: statusTestAPI{token: token}}, ticks, token, nil)
+	profiles, ok := findControl(w.Content(), func(s *widget.Select) bool {
+		return slices.Contains(s.Options, "Public test realm (PTR)")
+	})
+	if !ok {
+		t.Fatal("game profiles are unavailable")
+	}
+	profiles.SetSelected("Public test realm (PTR)")
+	tapButton(t, w.Content(), "Setup")
+	folder, ok := findControl(w.Content(), func(e *widget.Entry) bool {
+		return strings.Contains(e.PlaceHolder, "PTR game folder")
+	})
+	if !ok {
+		t.Fatal("PTR folder is unavailable in Setup")
+	}
+	destination := folder.Text
+	tapButton(t, w.Content(), "Continue")
+	tapButton(t, w.Content(), "Home")
+	if err := os.Rename(destination, filepath.Join(t.TempDir(), "deleted-PTR")); err != nil {
+		t.Fatal(err)
+	}
+	tapButton(t, w.Content(), "Setup")
+	tapButton(t, w.Content(), "Create PTR copy…")
+	form, ok := findControl(w.Canvas().Overlays().Top(), func(f *widget.Form) bool { return true })
+	if !ok {
+		t.Fatal("PTR destination form is unavailable")
+	}
+	row := slices.IndexFunc(form.Items, func(item *widget.FormItem) bool { return item.Text == "PTR folder" })
+	if row < 0 {
+		t.Fatal("PTR destination field is unavailable")
+	}
+	if got := form.Items[row].Widget.(*widget.Entry).Text; got != destination {
+		t.Fatalf("suggested copy destination = %q, want the previous PTR folder %q", got, destination)
+	}
+	requireActivity := func(text string) {
+		t.Helper()
+		if _, ok := findControl(w.Content(), func(label *widget.Label) bool { return label.Text == text }); !ok {
+			t.Fatalf("missing progress message %q", text)
+		}
+		if _, ok := findControl(w.Content(), (*widget.ProgressBarInfinite).Running); !ok {
+			t.Fatal("PTR activity bar is not running")
+		}
+	}
+	tapButton(t, w.Canvas().Overlays().Top(), "Check space")
+	requireActivity("Checking space for the PTR copy…")
+	driver.until(t, "copy confirmation", func() bool {
+		_, ok := findControl(w.Canvas().Overlays().Top(), func(b *widget.Button) bool { return b.Text == "Create copy" })
+		return ok
+	})
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("the space check created the destination: %v", err)
+	}
+	tapButton(t, w.Canvas().Overlays().Top(), "Create copy")
+	requireActivity("Copying game files for PTR…")
+	tapButton(t, w.Content(), "News")
+	requireActivity("Copying game files for PTR…")
+	driver.until(t, "copy completion", func() bool {
+		_, active := findControl(w.Content(), (*widget.ProgressBarInfinite).Running)
+		return !active
+	})
+	if _, ok := findControl(w.Content(), func(*widget.ProgressBarInfinite) bool { return true }); ok {
+		t.Fatal("copy activity stayed visible after completion")
+	}
+	tapButton(t, w.Content(), "Setup")
+	if _, ok := findControl(w.Content(), func(label *widget.Label) bool {
+		return strings.Contains(label.Text, "Install PTR from Home before playing")
+	}); !ok {
+		t.Fatal("Setup no longer shows the next step after copying")
+	}
+	prefsStore, err := launcher.NewPreferencesStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefs, err := prefsStore.Load()
+	if err != nil || prefs.ProductionRoot != production || prefs.PTRRoot != destination || !launcher.PTRNeedsInstall(destination) {
+		t.Fatalf("invalid preferences after copy: %+v, %v", prefs, err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, ".updaterToken")); !os.IsNotExist(err) {
+		t.Fatalf("PTR inherited Production's session: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, ".updaterToken"), []byte(token), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tapButton(t, w.Content(), "Home")
+	ticks <- time.Now()
+	driver.until(t, "enabled Install PTR action after recreating the folder", func() bool {
 		install, ok := findControl(w.Content(), func(b *widget.Button) bool { return b.Text == "Install PTR" })
 		return ok && !install.Disabled()
 	})

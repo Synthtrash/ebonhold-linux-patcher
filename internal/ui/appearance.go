@@ -89,6 +89,57 @@ func flushText(text fyne.CanvasObject) *fyne.Container {
 	return container.New(layout.NewCustomPaddedLayout(-pad/2, -pad/2, -pad, -pad), text)
 }
 
+// Keep the desktop column centered without making it a minimum window width.
+type centeredSetupColumn struct{}
+
+func (centeredSetupColumn) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	return objects[0].MinSize().AddWidthHeight(theme.ScrollBarSize()*2, 0)
+}
+
+func (centeredSetupColumn) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	column := objects[0]
+	width := min(max(738, column.MinSize().Width), size.Width-2*theme.ScrollBarSize())
+	column.Move(fyne.NewPos((size.Width-width)/2, 0))
+	column.Resize(fyne.NewSize(width, size.Height))
+}
+
+type homeLayout struct{ viewport *container.Scroll }
+
+const (
+	homeNewsWidth = 324
+	homeRailWidth = 440
+)
+
+func (h homeLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	news, rail := objects[0].MinSize(), objects[1].MinSize()
+	gutter, gap := theme.ScrollBarSize(), theme.Padding()
+	height := max(news.Height, rail.Height)
+	// The scroll's minimum height depends on whether its viewport fits both columns.
+	if h.viewport.Size().Width-gutter < max(homeNewsWidth, news.Width)+gap+max(homeRailWidth, rail.Width) {
+		height = rail.Height + gap + news.Height
+	}
+	return fyne.NewSize(max(news.Width, rail.Width)+gutter, height)
+}
+
+func (h homeLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	news, rail := objects[0], objects[1]
+	newsMin, railMin := news.MinSize(), rail.MinSize()
+	newsWidth, railWidth := max(homeNewsWidth, newsMin.Width), max(homeRailWidth, railMin.Width)
+	width := size.Width - theme.ScrollBarSize()
+	gap := theme.Padding()
+	if width < newsWidth+gap+railWidth {
+		rail.Move(fyne.NewPos(0, 0))
+		rail.Resize(fyne.NewSize(width, railMin.Height))
+		news.Move(fyne.NewPos(0, railMin.Height+gap))
+		news.Resize(fyne.NewSize(width, newsMin.Height))
+		return
+	}
+	news.Move(fyne.NewPos(0, size.Height-newsMin.Height))
+	news.Resize(fyne.NewSize(newsWidth, newsMin.Height))
+	rail.Move(fyne.NewPos(width-railWidth, 0))
+	rail.Resize(fyne.NewSize(railWidth, size.Height))
+}
+
 type headerLayout struct {
 	status     *widget.Label
 	brandWidth float32
@@ -102,19 +153,21 @@ const (
 
 func (h headerLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
 	brand, nav := objects[0].MinSize(), objects[1].MinSize()
-	return fyne.NewSize(brand.Width+nav.Width+minStatusWidth+2*headerGap, max(brand.Height, nav.Height, h.status.MinSize().Height))
+	return fyne.NewSize(brand.Width+nav.Width+statusDotSize+theme.Padding()+2*headerGap, max(brand.Height, nav.Height, h.status.MinSize().Height))
 }
 
 func (h headerLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 	brand, nav := objects[0].MinSize(), objects[1].MinSize()
-	brand.Width = max(brand.Width, min(h.brandWidth, size.Width-nav.Width-minStatusWidth-2*headerGap))
+	reserved := min(minStatusWidth, size.Width-brand.Width-nav.Width-2*headerGap)
+	reserved = max(statusDotSize+theme.Padding(), reserved)
+	brand.Width = max(brand.Width, min(h.brandWidth, size.Width-nav.Width-reserved-2*headerGap))
 	// Keep the tabs centered unless the window needs their space for the brand or status.
-	navX := min(max((size.Width-nav.Width)/2, brand.Width+headerGap), size.Width-nav.Width-minStatusWidth-headerGap)
+	navX := min(max((size.Width-nav.Width)/2, brand.Width+headerGap), size.Width-nav.Width-reserved-headerGap)
 	gap := theme.Padding()
 	pad := theme.InnerPadding()
 	textWidth := fyne.MeasureText(h.status.Text, theme.TextSize(), h.status.TextStyle).Width
 	// Fyne rounds down the ellipsis width limit. Give full strings a whole-pixel slot.
-	textWidth = min(float32(math.Ceil(float64(textWidth))), size.Width-navX-nav.Width-headerGap-statusDotSize-gap)
+	textWidth = max(0, min(float32(math.Ceil(float64(textWidth))), size.Width-navX-nav.Width-headerGap-statusDotSize-gap))
 	textLeft := size.Width - textWidth
 
 	place := func(obj fyne.CanvasObject, bounds fyne.Size, x float32) {

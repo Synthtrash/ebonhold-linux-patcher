@@ -75,3 +75,37 @@ func TestCopyClientCopiesIndependentGameFilesAndSkipsPrivateState(t *testing.T) 
 		t.Fatalf("updated copy is not ready for PTR: realm=%q err=%v", realm, err)
 	}
 }
+
+func TestClientCopySpaceCountsCopiedFilesWithoutCreatingDestination(t *testing.T) {
+	source, parent := t.TempDir(), t.TempDir()
+	for path, contents := range map[string]string{
+		"Wow.exe":                "wow",
+		"Client.DLL":              "dll",
+		"Data/base.MPQ":          "data",
+		"Data/Cache/private.wdb": "private",
+		"Data/.hidden":           "hidden",
+		"WTF/account.lua":        "private",
+	} {
+		full := filepath.Join(source, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(contents), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	destination := filepath.Join(parent, "copy")
+	needed, available, err := ClientCopySpace(context.Background(), source, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(len("wow") + len("dll") + len("data")); needed != want {
+		t.Fatalf("needed = %d; want %d", needed, want)
+	}
+	if available == 0 {
+		t.Fatal("destination parent reported no available space")
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("preview created destination: %v", err)
+	}
+}

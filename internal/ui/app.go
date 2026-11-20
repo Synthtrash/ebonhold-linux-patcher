@@ -20,6 +20,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/synthtrash/ebonhold-linux-patcher/internal/launcher"
@@ -66,7 +67,10 @@ var frostColors = map[fyne.ThemeColorName]color.Color{
 	theme.ColorNameWarning:             hexColor(colorAmber),
 }
 
-type frostTheme struct{ fyne.Theme }
+type frostTheme struct {
+	fyne.Theme
+	compact bool
+}
 
 func (t frostTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
 	if c, ok := frostColors[n]; ok {
@@ -76,7 +80,7 @@ func (t frostTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Colo
 }
 func (t frostTheme) Size(n fyne.ThemeSizeName) float32 {
 	size := t.Theme.Size(n)
-	if n == theme.SizeNameText {
+	if n == theme.SizeNameText && !t.compact {
 		return size + 2
 	}
 	return size
@@ -106,11 +110,17 @@ func (p loginPrompt) PromptLogin(ctx context.Context) (string, string, error) {
 		user, pass := widget.NewEntry(), widget.NewPasswordEntry()
 		user.SetPlaceHolder(p.tr("Username"))
 		pass.SetPlaceHolder(p.tr("Password"))
-		items := []*widget.FormItem{widget.NewFormItem(p.tr("Username"), user), widget.NewFormItem(p.tr("Password"), pass)}
+		note := wrappedLabel(p.tr("This signs you in for updates and add-ons. In WoW, select Remember Account Name to save only the name. Anyone who can read that game folder can see it. Leave this off on shared computers."))
+		items := []*widget.FormItem{
+			widget.NewFormItem(p.tr("Username"), user),
+			widget.NewFormItem(p.tr("Password"), pass),
+			widget.NewFormItem("", note),
+		}
 		d := dialog.NewForm(p.tr("Sign in"), p.tr("Sign in"), p.tr("Cancel"), items, func(ok bool) {
 			done <- answer{user: user.Text, pass: pass.Text, ok: ok}
 		}, p.win)
-		d.Resize(fyne.NewSize(440, 210))
+		size := p.win.Canvas().Size()
+		d.Resize(fyne.NewSize(min(520, size.Width-32), min(310, size.Height-32)))
 		d.Show()
 	})
 	select {
@@ -178,7 +188,16 @@ func Run(api *launcher.HTTPAPI, launcherRoot string) error {
 		return fmt.Errorf("initialize window backend: %w", err)
 	}
 	defer unlockThread()
-	a.Settings().SetTheme(frostTheme{Theme: theme.DefaultTheme()})
+	workArea := launcherWorkArea()
+	shortEdge := min(workArea.Width, workArea.Height)
+	compact := shortEdge > 0 && shortEdge <= compactDisplayEdge
+	if compact && !nativeWayland && os.Getenv("FYNE_DISABLE_DPI_DETECTION") == "" {
+		// A small panel can have high physical DPI even at 100% desktop scale.
+		if err := os.Setenv("FYNE_DISABLE_DPI_DETECTION", "1"); err != nil {
+			return err
+		}
+	}
+	a.Settings().SetTheme(frostTheme{Theme: theme.DefaultTheme(), compact: compact})
 	a.SetIcon(launcherIcon)
 	w := a.NewWindow(tr("Ebonhold Launcher"))
 	w.SetIcon(launcherIcon)
@@ -186,7 +205,9 @@ func Run(api *launcher.HTTPAPI, launcherRoot string) error {
 	defer statusTicker.Stop()
 	stop := setupWindow(w, api, launcherPath, prefsStore, prefs, statusTicker.C, api.News)
 	defer stop()
-	w.ShowAndRun()
+	w.Show()
+	fitLauncherWindow(w, workArea)
+	a.Run()
 	return nil
 }
 
@@ -223,6 +244,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	}
 	var mu sync.Mutex
 	var status *widget.Label
+	setupNotice := widget.NewLabel("")
+	setupNotice.Wrapping = fyne.TextWrapWord
 	save := func() bool {
 		mu.Lock()
 		err := prefsStore.Save(prefs)
@@ -266,13 +289,13 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		otherRoot := prefs.RootForProfile(otherSlug)
 		mu.Unlock()
-		if strings.TrimSpace(activeRoot) == "" && slug == "roguelike" {
+		if slug == "roguelike" && setupFolderMissing(activeRoot) {
 			return tr("Choose a separate PTR folder or create a copy from Production in Setup.")
 		}
 		if strings.TrimSpace(activeRoot) == "" {
 			return tr("Choose the Production client folder in Setup.")
 		}
-		if strings.TrimSpace(otherRoot) == "" && slug == "roguelike-prod" {
+		if slug == "roguelike-prod" && setupFolderMissing(otherRoot) {
 			return tr("To try PTR, switch profiles and create a separate copy in Setup.")
 		}
 		return tr("Production and PTR use separate folders.")
@@ -286,6 +309,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	var updateResult launcher.UpdateResult
 	var updateHasRun, updateInProgress, updateFailed, updateVerify bool
 	var copyInProgress bool
+	var setCopyActivity func(string)
 	var playButton, settingsButton, copyPTR, searchFolders *widget.Button
 	var updateError string
 	resetUpdate := func() {
@@ -323,6 +347,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		if err := updated.ValidateRootForProfile(profile, s); err != nil {
 			root.SetText(updated.RootForProfile(profile))
+			setupNotice.SetText(tr(err.Error()))
 			if status != nil {
 				status.SetText(tr(err.Error()))
 			}
@@ -338,6 +363,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			root.SetText(previousRoot)
 			return
 		}
+		setupNotice.SetText("")
 		resetUpdate()
 		if status != nil {
 			if strings.TrimSpace(s) == "" {
@@ -582,7 +608,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			}
 		})
 	}
-	gameActionBusy := func() bool { return updateInProgress || copyInProgress || signingIn }
+	var checkingLaunch bool
+	gameActionBusy := func() bool { return updateInProgress || copyInProgress || signingIn || checkingLaunch }
 	gameRoot := func() (string, error) {
 		rootPath, err := clientRoot()
 		if err == nil {
@@ -590,28 +617,58 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		return rootPath, err
 	}
+	cvarsFor := func(profile, folder string) func(string) (bool, error) {
+		return func(input string) (bool, error) {
+			if gameActionBusy() || selectedGame() != profile || selectedRoot() != folder {
+				return false, errors.New(tr("Wait for the current operation to finish, then reopen Game CVars for the selected folder."))
+			}
+			rootPath, err := gameRoot()
+			if err != nil {
+				return false, err
+			}
+			return launcher.ApplyGameCVars(rootPath, input)
+		}
+	}
+	showLaunchHelp := func(manager string, issue launchIssue, output string) {
+		var openCVars func()
+		if _, err := gameRoot(); err == nil && !gameActionBusy() {
+			profileName := game.Selected
+			apply := cvarsFor(selectedGame(), selectedRoot())
+			openCVars = func() { showGameCVars(w, tr, profileName, apply) }
+		}
+		showTroubleshoot(w, tr, managerNames[manager], issue, output, openCVars)
+	}
+	newTroubleshootButton := func() *widget.Button {
+		button := widget.NewButton(tr("Troubleshoot"), func() { showLaunchHelp(launchTarget().Manager, "", "") })
+		button.Importance = widget.LowImportance
+		return button
+	}
+	launchFailed := func(manager string, issue launchIssue, output string, report func(string)) {
+		report(tr("Could not launch game"))
+		showLaunchHelp(manager, issue, output)
+	}
 	var launchAttempt uint64
-	startGame := func(command *exec.Cmd, rootPath, profile, manager string) {
+	startGame := func(command *exec.Cmd, rootPath, profile, manager string, report func(string)) {
+		attempt := launchAttempt
+		fail := func(err error) { launchFailed(manager, classifyLaunchIssue(manager, err, ""), err.Error(), report) }
 		// The manager can outlive this window. A file keeps its output open without a reader in the launcher.
 		log, err := os.CreateTemp("", "ebonhold-launch-*")
 		if err != nil {
-			showErr(tr("Could not launch game"), err)
+			fail(err)
 			return
 		}
 		if err := os.Remove(log.Name()); err != nil {
 			log.Close()
-			showErr(tr("Could not launch game"), err)
+			fail(err)
 			return
 		}
 		command.Stdout, command.Stderr = log, log
 		if err := command.Start(); err != nil {
 			log.Close()
-			showErr(tr("Could not launch game"), err)
+			fail(err)
 			return
 		}
-		launchAttempt++
-		attempt := launchAttempt
-		status.SetText(tr("Launch requested from %s.", managerNames[manager]))
+		report(tr("Launch requested from %s.", managerNames[manager]))
 		go func() {
 			defer log.Close()
 			waitErr := command.Wait()
@@ -626,27 +683,18 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 				n, _ := log.ReadAt(buf, info.Size()-size)
 				output = strings.TrimSpace(string(buf[:n]))
 			}
-			var reason string
-			switch {
-			case strings.HasPrefix(manager, "bottles-") &&
-				strings.Contains(output, "err:winediag:nodrv_CreateWindow") &&
-				strings.Contains(output, "Make sure that your X server is running"):
-				reason = tr("Wine could not open the X11 display.") + "\n" +
-					tr("On Wayland, sign out of your desktop and back in, then try Play again.")
-			case waitErr != nil:
-				reason = waitErr.Error()
-			default:
+			output = terminalEscape.ReplaceAllString(output, "")
+			issue := classifyLaunchIssue(manager, waitErr, output)
+			if issue == "" {
 				return
 			}
-			if output != "" {
-				reason += "\n\n" + terminalEscape.ReplaceAllString(output, "")
+			if waitErr != nil {
+				output = strings.TrimSpace(waitErr.Error() + "\n\n" + output)
 			}
 			post(func() {
 				currentRoot, _ := clientRoot()
 				if attempt == launchAttempt && selectedGame() == profile && currentRoot == rootPath {
-					status.SetText(tr("Could not launch game"))
-					refreshUpdateUI()
-					showDetails(tr("Could not launch game"), reason)
+					launchFailed(manager, issue, output, report)
 				}
 			})
 		}()
@@ -792,7 +840,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	}
 	updateBtn := widget.NewButton(tr("Update files"), func() { updateFilesOnly(false) })
 	verifyBtn := widget.NewButton(tr("Verify files"), func() { updateFilesOnly(true) })
-	playButton = widget.NewButtonWithIcon(tr("Play"), theme.MediaPlayIcon(), func() {
+	launchGame := func(testOnly bool) {
 		if gameActionBusy() {
 			return
 		}
@@ -814,6 +862,13 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			showErr(tr("Could not launch game"), errors.New(tr("Update this PTR copy before playing.")))
 			return
 		}
+		launchAttempt++
+		report := func(text string) {
+			status.SetText(text)
+			if testOnly {
+				setupNotice.SetText(text)
+			}
+		}
 		// Closing the launcher must not stop the game.
 		var args []string
 		if strings.HasPrefix(target.Manager, "bottles-") {
@@ -821,27 +876,52 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 		command, err := target.Command(context.Background(), rootPath, args...)
 		if err != nil {
-			showErr(tr("Could not launch game"), err)
+			launchFailed(target.Manager, classifyLaunchIssue(target.Manager, err, ""), err.Error(), report)
 			return
 		}
-		if settings.UpdateBeforePlay {
-			runUpdate(rootPath, profile, settings, false, func() {
-				if _, err := selectedGameExecutable(rootPath); err != nil {
-					showErr(tr("Could not launch game"), err)
+		requestLaunch := func() {
+			if settings.UpdateBeforePlay && !testOnly {
+				runUpdate(rootPath, profile, settings, false, func() {
+					if _, err := selectedGameExecutable(rootPath); err != nil {
+						showErr(tr("Could not launch game"), err)
+						return
+					}
+					startGame(command, rootPath, profile, target.Manager, report)
+				})
+				return
+			}
+			startGame(command, rootPath, profile, target.Manager, report)
+		}
+		if target.Manager != "bottles-flatpak" {
+			requestLaunch()
+			return
+		}
+		checkingLaunch = true
+		report(tr("Checking whether Bottles can read Wow.exe…"))
+		refreshSetup()
+		async(func(ctx context.Context) {
+			issue := checkFlatpakLaunch(ctx, target.Manager, filepath.Join(rootPath, "Wow.exe"))
+			post(func() {
+				checkingLaunch = false
+				refreshSetup()
+				currentRoot, _ := clientRoot()
+				if gameActionBusy() || currentRoot != rootPath || selectedGame() != profile || launchTarget() != target {
 					return
 				}
-				startGame(command, rootPath, profile, target.Manager)
+				if issue != "" {
+					launchFailed(target.Manager, issue, "", report)
+					return
+				}
+				requestLaunch()
 			})
-			return
-		}
-		startGame(command, rootPath, profile, target.Manager)
-		refreshUpdateUI()
-	})
+		})
+	}
+	playButton = widget.NewButtonWithIcon(tr("Play"), theme.MediaPlayIcon(), func() { launchGame(false) })
 	playButton.Importance = widget.HighImportance
 	var updateActivityButton, verifyActivityButton *widget.Button
 	var launchSetupButton *widget.Button
 	signInButton := widget.NewButton(tr("Sign in"), func() {
-		if signingIn || updateInProgress || copyInProgress {
+		if gameActionBusy() {
 			return
 		}
 		rootPath, err := clientRoot()
@@ -881,20 +961,58 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	})
 	signInButton.Importance = widget.HighImportance
 	var fileActions, launchRow *fyne.Container
-	var homeRail *container.Scroll
+	var homeScroll *container.Scroll
 	chooseFolder := func() {
-		if updateInProgress || copyInProgress {
+		if gameActionBusy() {
 			return
 		}
 		profile := selectedGame()
-		dialog.NewFolderOpen(func(uri fyne.ListableURI, e error) {
-			if e == nil && uri != nil && !updateInProgress && !copyInProgress && selectedGame() == profile {
+		picker := dialog.NewFolderOpen(func(uri fyne.ListableURI, e error) {
+			if e == nil && uri != nil && !gameActionBusy() && selectedGame() == profile {
 				root.SetText(uri.Path())
 			}
-		}, w).Show()
+		}, w)
+		showSetupPicker(w, picker, tr("Choose game folder"))
 	}
 	browse := widget.NewButton(tr("Choose folder…"), chooseFolder)
+	browseExecutable := widget.NewButton(tr("Choose Wow.exe…"), func() {
+		if gameActionBusy() {
+			return
+		}
+		profile := selectedGame()
+		picker := dialog.NewFileOpen(func(file fyne.URIReadCloser, err error) {
+			if file != nil {
+				defer file.Close()
+			}
+			if gameActionBusy() || selectedGame() != profile {
+				return
+			}
+			if err != nil {
+				setupNotice.SetText(err.Error())
+				return
+			}
+			if file == nil {
+				return
+			}
+			uri := file.URI()
+			if uri.Scheme() != "file" || uri.Name() != "Wow.exe" {
+				setupNotice.SetText(tr("Choose Wow.exe in the Ebonhold game folder."))
+				return
+			}
+			path := filepath.Dir(uri.Path())
+			if _, err := selectedGameExecutable(path); err != nil {
+				setupNotice.SetText(tr(err.Error()))
+				return
+			}
+			root.SetText(path)
+		}, w)
+		picker.SetFilter(storage.NewExtensionFileFilter([]string{".exe"}))
+		showSetupPicker(w, picker, tr("Choose Wow.exe…"))
+	})
 	findGameFolder := func() {
+		if gameActionBusy() {
+			return
+		}
 		mu.Lock()
 		searchProfile := prefs.GameSlug
 		searchRoot := prefs.RootForProfile(searchProfile)
@@ -909,23 +1027,16 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 				}
 			}
 			post(func() {
-				if updateInProgress || copyInProgress || selectedGame() != searchProfile || selectedRoot() != searchRoot {
+				if gameActionBusy() || selectedGame() != searchProfile || selectedRoot() != searchRoot {
 					return
 				}
 				switch len(candidates) {
 				case 0:
-					messageText := tr("I couldn't find a separate game folder in common install locations. Choose a folder containing Data/ and Wow.exe.")
+					messageText := tr("No game folder found. Choose the folder or select Wow.exe.")
 					if len(allCandidates) > 0 {
 						messageText = tr("The folders found are already assigned to the other profile. Choose a different folder containing Data/ and Wow.exe.")
 					}
-					message := widget.NewLabel(messageText)
-					message.Wrapping = fyne.TextWrapWord
-					form := dialog.NewForm(tr("Choose game folder"), tr("Choose folder…"), tr("Not now"), []*widget.FormItem{widget.NewFormItem("", message)}, func(ok bool) {
-						if ok && selectedGame() == searchProfile && selectedRoot() == searchRoot {
-							chooseFolder()
-						}
-					}, w)
-					form.Show()
+					setupNotice.SetText(messageText)
 				case 1:
 					message := widget.NewLabel(tr("Possible separate game folder found:\n%s\n\nUse this folder, or choose another one.", candidates[0]))
 					message.Wrapping = fyne.TextWrapWord
@@ -1262,12 +1373,11 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	preset.Wrapping = fyne.TextWrapWord
 	preset.Disable()
 	detectedManagerText := tr("Detecting installed game managers…")
-	setupNotice := widget.NewLabel("")
-	setupNotice.Wrapping = fyne.TextWrapWord
 	setupStep := 1
 	var setSetupStep func(int)
 	var setupPanel *fyne.Container
-	var setupView *container.Scroll
+	var setupView *fyne.Container
+	var setupScroll *container.Scroll
 	var reviewFolderReady, reviewLaunchReady bool
 	reviewTitle := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	reviewNext := widget.NewLabel("")
@@ -1297,55 +1407,119 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		}
 	}
 	searchFolders = widget.NewButton(tr("Search common locations"), findGameFolder)
+	firstRunChoices := container.NewGridWithColumns(2,
+		widget.NewButton(tr("I already have Ebonhold"), findGameFolder),
+		widget.NewButton(tr("I need to install it"), func() { showInstallHelp(w, tr) }),
+	)
+	offerPTRCopy := func() bool {
+		mu.Lock()
+		profile, production, ptr := prefs.GameSlug, prefs.ProductionRoot, prefs.PTRRoot
+		mu.Unlock()
+		return profile == "roguelike" && strings.TrimSpace(production) != "" && setupFolderMissing(ptr)
+	}
 	copyPTR = widget.NewButton(tr("Create PTR copy…"), func() {
-		if updateInProgress || copyInProgress || selectedGame() != "roguelike" || selectedRoot() != "" {
+		canCopy := func() bool {
+			return !gameActionBusy() && offerPTRCopy()
+		}
+		if !canCopy() {
 			return
 		}
 		mu.Lock()
-		source := prefs.ProductionRoot
+		original := prefs.ProductionRoot
 		mu.Unlock()
-		if _, err := selectedGameExecutable(source); source == "" || err != nil {
+		source, err := filepath.Abs(original)
+		if original == "" || err != nil {
 			setupNotice.SetText(tr("Choose the Production client folder in Setup."))
 			return
 		}
-		destination := widget.NewEntry()
-		destination.SetText(filepath.Join(filepath.Dir(source), "Ebonhold-PTR"))
-		note := widget.NewLabel(tr("Choose a new folder. Copying the base client needs several GB of free space. Your Production files and sign-in stay untouched."))
-		note.Wrapping = fyne.TextWrapWord
-		form := dialog.NewForm(tr("Create PTR copy"), tr("Create copy"), tr("Cancel"), []*widget.FormItem{
-			widget.NewFormItem("", note), widget.NewFormItem(tr("PTR folder"), destination),
-		}, func(ok bool) {
-			if !ok {
+		if _, err := selectedGameExecutable(source); err != nil {
+			setupNotice.SetText(tr("Choose the Production client folder in Setup."))
+			return
+		}
+		beginCopy := func(path string) {
+			if !canCopy() {
 				return
 			}
-			path := strings.TrimSpace(destination.Text)
-			if path == "" {
-				setupNotice.SetText(tr("Enter a new PTR folder."))
-				return
-			}
-			copyInProgress = true
-			setupNotice.SetText(tr("Copying game files for PTR…"))
-			refreshSetup()
+			setCopyActivity("Copying game files for PTR…")
 			copyWork.Add(1)
 			async(func(ctx context.Context) {
 				defer copyWork.Done()
 				err := launcher.CopyClient(ctx, source, path)
-				if ctx.Err() != nil {
-					return
-				}
 				post(func() {
-					copyInProgress = false
-					refreshSetup()
+					setCopyActivity("")
 					if err != nil {
-						setupNotice.SetText(tr("Could not create PTR copy") + ": " + err.Error())
+						setupNotice.SetText(tr("Could not create PTR copy") + ": " + tr(err.Error()))
 						return
 					}
-					root.SetText(path)
+					if selectedRoot() == path {
+						// The path did not change, but this is a new installation.
+						resetUpdate()
+						clientTargetChanged()
+					} else {
+						root.SetText(path)
+					}
 					if selectedRoot() != path {
 						setupNotice.SetText(tr("PTR copy created. Choose its folder to finish setup."))
 						return
 					}
 					setupNotice.SetText(tr("PTR copy ready. Install PTR from Home before playing."))
+				})
+			})
+		}
+		destination := widget.NewEntry()
+		suggested := selectedRoot()
+		if !filepath.IsAbs(suggested) {
+			suggested = filepath.Join(filepath.Dir(source), "Ebonhold-PTR")
+		}
+		destination.SetText(suggested)
+		destination.Validator = func(text string) error {
+			if !filepath.IsAbs(strings.TrimSpace(text)) {
+				return errors.New(tr("Enter the full path to a new PTR folder."))
+			}
+			return nil
+		}
+		form := dialog.NewForm(tr("Create PTR copy"), tr("Check space"), tr("Cancel"), []*widget.FormItem{
+			widget.NewFormItem("", wrappedLabel(tr("Choose a new folder for the base game files. Your existing game files and sign-in stay untouched."))),
+			widget.NewFormItem(tr("PTR folder"), destination),
+		}, func(ok bool) {
+			if !ok || !canCopy() {
+				return
+			}
+			path := filepath.Clean(strings.TrimSpace(destination.Text))
+			setCopyActivity("Checking space for the PTR copy…")
+			copyWork.Add(1)
+			async(func(ctx context.Context) {
+				defer copyWork.Done()
+				needed, available, err := launcher.ClientCopySpace(ctx, source, path)
+				post(func() {
+					setCopyActivity("")
+					if err != nil {
+						setupNotice.SetText(tr("Could not check copy space: %s", tr(err.Error())))
+						return
+					}
+					if !canCopy() {
+						return
+					}
+					folder := widget.NewLabel(path)
+					folder.Wrapping = fyne.TextWrapBreak
+					space := container.NewVBox(wrappedLabel(tr("PTR destination")), folder,
+						wrappedLabel(tr("Estimated copy: %s\nFree on this drive: %s", copySize(needed), copySize(available))))
+					size := fyne.NewSize(min(580, w.Canvas().Size().Width-32), min(315, w.Canvas().Size().Height-32))
+					if needed > available {
+						space.Add(wrappedLabel(tr("Not enough space. Choose a new folder on a drive with more free space.")))
+						d := dialog.NewCustom(tr("Create PTR copy"), tr("Close"), container.NewVScroll(space), w)
+						d.Resize(size)
+						d.Show()
+						return
+					}
+					space.Add(wrappedLabel(tr("The first PTR update may need more space.")))
+					d := dialog.NewCustomConfirm(tr("Create PTR copy"), tr("Create copy"), tr("Cancel"), container.NewVScroll(space), func(ok bool) {
+						if ok {
+							beginCopy(path)
+						}
+					}, w)
+					d.Resize(size)
+					d.Show()
 				})
 			})
 		}, w)
@@ -1356,9 +1530,10 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	folderHint.Wrapping = fyne.TextWrapWord
 	step1Content := container.NewVBox(
 		widget.NewLabelWithStyle(tr("Choose the game folder"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		firstRunChoices,
 		folderHint,
 		widget.NewLabelWithStyle(tr("Game files folder"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		container.NewBorder(nil, nil, nil, browse, root),
+		container.NewBorder(nil, nil, nil, container.NewHBox(browse, browseExecutable), root),
 		gameExecutableInfo,
 		container.NewGridWithColumns(2,
 			searchFolders,
@@ -1368,7 +1543,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	)
 	managerOptions := make([]fyne.CanvasObject, 0, len(managerChoices)-1)
 	setManager := func(manager string) {
-		if updateInProgress || copyInProgress {
+		if gameActionBusy() {
 			return
 		}
 		mu.Lock()
@@ -1392,69 +1567,23 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			managerOptions = append(managerOptions, button)
 		}
 	}
-	targetAction := func(manager string) string {
-		if strings.HasPrefix(manager, "bottles-") {
-			return tr("Choose a bottle…")
-		}
-		return tr("Choose a game shortcut…")
-	}
 	editLaunchTarget := func() {
 		target := launchTarget()
-		profile := selectedGame()
-		manager, rootPath := target.Manager, selectedRoot()
-		picker := widget.NewSelectEntry(nil)
-		picker.SetText(target.ID)
-		isBottle := strings.HasPrefix(manager, "bottles-")
-		field, help := tr("Bottle name"), tr("Pick the bottle you use for Ebonhold, or type its name as shown in Bottles.")
-		placeholder := tr("Select or type a bottle name")
-		loading := tr("Finding bottles…")
-		emptyHint := tr("No bottles were listed. In Bottles, find the setup you use for Ebonhold and type its name here.")
-		if !isBottle {
-			field = tr("Game shortcut")
-			help = tr("Choose the shortcut for this game folder, or enter its shortcut ID.")
-			loading = tr("Finding shortcuts…")
-			placeholder = tr("Choose a shortcut or enter its ID")
-			if manager == "steam" {
-				emptyHint = tr("No matching Steam shortcut. Add this folder's Wow.exe as a non-Steam game, or copy the number after steam://rungameid/ from its desktop shortcut.")
-			} else {
-				emptyHint = tr("No matching Lutris entry. Add this folder's Wow.exe to Lutris, or copy the number after lutris:rungameid/ from its desktop shortcut.")
-			}
+		profile, path := selectedGame(), selectedRoot()
+		gameFolder, err := clientRoot()
+		if err != nil {
+			setupNotice.SetText(tr(err.Error()))
+			return
 		}
-		picker.SetPlaceHolder(loading)
-		var shortcutIDs map[string]string
-		resolveID := func(value string) string {
-			if id, found := shortcutIDs[value]; found {
-				return id
-			}
-			return value
-		}
-		picker.Validator = func(value string) error {
-			draft := target
-			draft.ID = resolveID(value)
-			mu.Lock()
-			err := prefs.ValidateLaunchTargetForProfile(profile, draft)
-			mu.Unlock()
-			if err != nil {
-				return errors.New(tr(err.Error()))
-			}
-			return nil
-		}
-		note := widget.NewLabel(help)
-		note.Wrapping = fyne.TextWrapWord
-		closed := false
-		form := dialog.NewForm(targetAction(target.Manager), tr("Save"), tr("Cancel"), []*widget.FormItem{
-			widget.NewFormItem("", note), widget.NewFormItem(field, picker),
-		}, func(ok bool) {
-			closed = true
-			if !ok {
+		showLaunchTarget(windowCtx, w, tr, target, gameFolder, func(id string) {
+			if gameActionBusy() || selectedGame() != profile || selectedRoot() != path || launchTarget() != target {
 				return
 			}
+			next := launcher.LaunchTarget{Manager: target.Manager, ID: id}
 			mu.Lock()
-			old := prefs.LaunchTargetForProfile(profile)
-			target.ID = resolveID(picker.Text)
-			err := prefs.ValidateLaunchTargetForProfile(profile, target)
+			err := prefs.ValidateLaunchTargetForProfile(profile, next)
 			if err == nil {
-				prefs.SetLaunchTargetForProfile(profile, target)
+				prefs.SetLaunchTargetForProfile(profile, next)
 			}
 			mu.Unlock()
 			if err != nil {
@@ -1463,76 +1592,27 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			}
 			if !save() {
 				mu.Lock()
-				prefs.SetLaunchTargetForProfile(profile, old)
+				prefs.SetLaunchTargetForProfile(profile, target)
 				mu.Unlock()
 				return
 			}
 			setupNotice.SetText("")
 			refreshSetup()
-		}, w)
-		form.Resize(fyne.NewSize(580, 256))
-		form.Show()
-		dropdown := picker.ActionItem.(fyne.Disableable)
-		dropdown.Disable()
-		async(func(ctx context.Context) {
-			var options []string
-			var ids map[string]string
-			if isBottle {
-				options, _ = launcher.ListBottles(ctx, manager)
-			} else if root, err := filepath.Abs(rootPath); err == nil && rootPath != "" {
-				shortcuts := launcher.ListGameShortcuts(ctx, manager, root)
-				counts := make(map[string]int, len(shortcuts))
-				for _, shortcut := range shortcuts {
-					counts[shortcut.Name]++
-				}
-				ids = make(map[string]string, len(shortcuts))
-				options = make([]string, 0, len(shortcuts))
-				for _, shortcut := range shortcuts {
-					label := shortcut.Name
-					if counts[label] > 1 || (label[0] >= '0' && label[0] <= '9') {
-						label += " · " + shortcut.ID
-					}
-					ids[label] = shortcut.ID
-					options = append(options, label)
-				}
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			post(func() {
-				if closed {
-					return
-				}
-				shortcutIDs = ids
-				picker.SetPlaceHolder(placeholder)
-				if len(options) == 0 {
-					if !isBottle {
-						picker.SetPlaceHolder(tr("Enter the shortcut ID"))
-					}
-					note.SetText(emptyHint)
-					form.Refresh()
-					return
-				}
-				picker.SetOptions(options)
-				dropdown.Enable()
-				if !isBottle && picker.Text == target.ID {
-					for _, option := range options {
-						if ids[option] == target.ID {
-							picker.SetText(option)
-							break
-						}
-					}
-				}
-			})
 		})
 	}
 	targetButton := widget.NewButton("", editLaunchTarget)
 	managerNotice := widget.NewLabel(tr("The launcher does not edit your manager's settings."))
 	managerNotice.Wrapping = fyne.TextWrapWord
 	managerNotice.Importance = widget.LowImportance
+	managerInstall := container.NewVBox(
+		wrappedLabel(tr("New to Linux? Install Bottles and create a Gaming bottle. Use Run Executable to open Wow.exe, then select that bottle here.")),
+		container.NewHBox(bottlesInstallLink(tr)),
+	)
+	managerInstall.Hide()
 	step2Content := container.New(layout.NewCustomPaddedVBoxLayout(8),
 		headingText(tr("Which app do you use to start Ebonhold?"), 16),
 		flushText(managerInfo),
+		managerInstall,
 		container.NewGridWithColumns(2, managerOptions...),
 		flushText(managerHint),
 		container.NewBorder(nil, nil, targetButton, managerButtons[""]),
@@ -1546,6 +1626,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	summaryValue := func(label *widget.Label) fyne.CanvasObject {
 		return container.New(layout.NewCustomPaddedLayout(0, 0, 12, 0), flushText(label))
 	}
+	testLaunch := widget.NewButtonWithIcon(tr("Test launch"), theme.MediaPlayIcon(), func() { launchGame(true) })
 	step3Content := container.New(layout.NewCustomPaddedVBoxLayout(10),
 		flushText(reviewTitle),
 		flushText(reviewNext),
@@ -1555,6 +1636,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			flushText(widget.NewLabel(tr("Game folder"))), summaryValue(setupSummaryFolder),
 			flushText(widget.NewLabel(tr("Start with"))), summaryValue(setupSummaryManager),
 		),
+		container.NewHBox(testLaunch),
 		advanced,
 	)
 	setupScreens := map[int]fyne.CanvasObject{1: step1Content, 2: step2Content, 3: step3Content}
@@ -1564,9 +1646,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	setupNext.Importance = widget.HighImportance
 	setupBack.OnTapped = func() {
 		if setupStep > 1 {
-			setupStep--
-			setupNotice.SetText("")
-			refreshSetup()
+			setSetupStep(setupStep - 1)
 		}
 	}
 	setupNext.OnTapped = func() {
@@ -1582,9 +1662,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			migrateSavedPasswords(rootPath)
 		}
 		if setupStep < 3 {
-			setupStep++
-			setupNotice.SetText("")
-			refreshSetup()
+			setSetupStep(setupStep + 1)
 			return
 		}
 		if !reviewFolderReady {
@@ -1595,12 +1673,10 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			editLaunchTarget()
 			return
 		}
-		setupStep = 1
-		setupNotice.SetText("")
+		setSetupStep(1)
 		if switchScreen != nil {
 			switchScreen("home")
 		}
-		refreshSetup()
 	}
 	setSetupStep = func(step int) {
 		if step < 1 {
@@ -1612,24 +1688,27 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		setupStep = step
 		setupNotice.SetText("")
 		refreshSetup()
+		if setupScroll != nil {
+			setupScroll.ScrollToTop()
+		}
 	}
 	refreshSetup = func() {
 		target := launchTarget()
 		key := target.Manager
 		selected := managerNames[key]
-		busy := updateInProgress || copyInProgress || signingIn
+		busy := gameActionBusy()
 		if key == "" {
 			targetButton.Hide()
 		} else {
-			targetButton.SetText(targetAction(key))
+			targetButton.SetText(launchTargetTitle(tr, key))
 			targetButton.Show()
 		}
 		setEnabled(targetButton, key != "" && !busy)
 		mu.Lock()
-		canCopy := prefs.ProductionRoot != "" && prefs.PTRRoot == ""
 		reviewLaunchReady = prefs.ValidateLaunchTargetForProfile(prefs.GameSlug, target) == nil
 		mu.Unlock()
-		if selectedGame() == "roguelike" && canCopy {
+		canCopy := offerPTRCopy()
+		if canCopy {
 			copyPTR.Show()
 			setEnabled(copyPTR, !busy)
 		} else {
@@ -1645,14 +1724,34 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		} else {
 			gameExecutableInfo.SetText(tr("Ready · Data/ and Wow.exe found"))
 		}
+		if selectedRoot() == "" {
+			gameExecutableInfo.Hide()
+		} else {
+			gameExecutableInfo.Show()
+		}
 		reviewFolderReady = executableErr == nil
+		needsPTRInstall := reviewFolderReady && selectedGame() == "roguelike" && launcher.PTRNeedsInstall(rootPath)
+		if reviewFolderReady && reviewLaunchReady && !needsPTRInstall {
+			testLaunch.Show()
+		} else {
+			testLaunch.Hide()
+		}
+		setEnabled(testLaunch, !busy)
+		newInstall := !reviewFolderReady && (selectedGame() != "roguelike" || !canCopy)
+		if newInstall {
+			firstRunChoices.Show()
+			searchFolders.Hide()
+		} else {
+			firstRunChoices.Hide()
+			searchFolders.Show()
+		}
 		setupSummaryFolder.SetText(rootPath)
 		if rootErr != nil {
 			setupSummaryFolder.SetText(tr("Not selected"))
 		}
 		setupSummaryProfile.SetText(game.Selected)
 		targetText := selected
-		if target.ID != "" {
+		if target.ID != "" && strings.HasPrefix(key, "bottles-") {
 			targetText += " · " + target.ID
 		}
 		setupSummaryManager.SetText(targetText)
@@ -1702,8 +1801,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			case key != "" && !reviewLaunchReady:
 				reviewTitle.SetText(tr("One more step before you can play"))
 				reviewNext.SetText(managerLaunchHint(key))
-				next = targetAction(key)
-			case selectedGame() == "roguelike" && launcher.PTRNeedsInstall(rootPath):
+				next = launchTargetTitle(tr, key)
+			case needsPTRInstall:
 				reviewTitle.SetText(tr("Update this PTR copy before playing."))
 				message := tr("On Home, sign in if asked and choose Install PTR.")
 				if key == "" {
@@ -1715,7 +1814,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 				reviewNext.SetText(tr("On Home, sign in if asked and choose Update files.") + " " + tr("Then start the game from your usual app."))
 			default:
 				reviewTitle.SetText(tr("Ready to play"))
-				reviewNext.SetText(tr("Choose Play on Home to start the game. Use Update files when a patch is available."))
+				reviewNext.SetText(tr("Use Test launch to try opening WoW without a launcher update. You can also use Play from Home."))
 			}
 			setupNext.SetText(next)
 			setEnabled(setupNext, !busy)
@@ -1735,7 +1834,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			}
 		} else {
 			setupNext.SetText(tr("Continue"))
-			setEnabled(setupNext, !busy)
+			setEnabled(setupNext, !busy && (setupStep != 1 || reviewFolderReady))
 		}
 		if setupView != nil {
 			setupView.Refresh()
@@ -1756,6 +1855,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		post(func() {
 			if len(names) == 0 {
 				detectedManagerText = tr("No launch apps detected.")
+				managerInstall.Show()
 			} else {
 				detectedManagerText = tr("Detected as installed: ") + strings.Join(names, ", ") + "."
 			}
@@ -1763,17 +1863,15 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		})
 	}()
 	setupStepBar := container.NewGridWithColumns(3, flushText(stepHeaders[0]), flushText(stepHeaders[1]), flushText(stepHeaders[2]))
-	setupFooter := container.NewBorder(nil, nil, setupBack, setupNext, setupNotice)
+	setupFooter := container.NewBorder(nil, nil, setupBack, container.NewHBox(newTroubleshootButton(), setupNext), setupNotice)
 	setupColumn := container.New(layout.NewCustomPaddedVBoxLayout(8),
-		headingText(tr("Set up your game client"), 26),
+		headingText(tr("Set up your game client"), theme.TextSize()+10),
 		setupStepBar,
 		widget.NewSeparator(),
 		card(setupPanel),
-		setupFooter,
 	)
-	setupWidth := canvas.NewRectangle(color.Transparent)
-	setupWidth.SetMinSize(fyne.NewSize(738, 1))
-	setupView = container.NewVScroll(container.NewVBox(container.NewCenter(container.NewStack(setupWidth, setupColumn))))
+	setupScroll = container.NewVScroll(container.New(centeredSetupColumn{}, setupColumn))
+	setupView = container.NewBorder(nil, container.New(centeredSetupColumn{}, setupFooter), nil, nil, setupScroll)
 	refreshSetup()
 	updateState := canvas.NewText(tr("READY TO UPDATE"), hexColor(colorAmber))
 	updateState.TextSize = 14
@@ -1818,7 +1916,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			updateState.Text, updateState.Color = tr("UPDATE IN PROGRESS"), hexColor(colorBlue)
 			homeHeading.SetText(tr("Updating Ebonhold"))
 			homeDescription.SetText(tr("Wait for the update to finish before playing."))
-		case !updateHasRun && !clientReady:
+		case !clientReady:
 			updateState.Text, updateState.Color = tr("SETUP REQUIRED"), hexColor(colorBlue)
 			homeHeading.SetText(tr("Choose your game folder"))
 			homeDescription.SetText(tr("Choose the Ebonhold folder. It contains Wow.exe and a folder named Data."))
@@ -1921,7 +2019,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		if verifyActivityButton != nil {
 			verifyActivityButton.SetText(tr("Verify files"))
 		}
-		busy := updateInProgress || copyInProgress || signingIn
+		busy := gameActionBusy()
 		setEnabled(signInButton, !busy)
 		if sessionChecked && signInNeeded {
 			loadCatalog.SetText(tr("Sign in"))
@@ -1939,6 +2037,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		setEnabled(game, !busy)
 		setEnabled(root, !busy)
 		setEnabled(browse, !busy)
+		setEnabled(browseExecutable, !busy)
 		setEnabled(searchFolders, !busy)
 		if homeGame != nil {
 			setEnabled(homeGame, !busy)
@@ -2021,8 +2120,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		} else {
 			activityProgress.Hide()
 		}
-		if homeRail != nil {
-			homeRail.Refresh()
+		if homeScroll != nil {
+			homeScroll.Refresh()
 		}
 	}
 	refreshUpdateUI()
@@ -2062,17 +2161,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		original := prefs
 		mu.Unlock()
 		before := original.GameSettingsForProfile(profile)
-		applyCVars := func(input string) (bool, error) {
-			if gameActionBusy() || selectedGame() != profile {
-				return false, errors.New(tr("Wait for the current launcher operation to finish and reopen Settings."))
-			}
-			rootPath, err := gameRoot()
-			if err != nil {
-				return false, err
-			}
-			return launcher.ApplyGameCVars(rootPath, input)
-		}
-		showSettings(w, tr, game.Selected, original.LauncherLanguage, original.LaunchTargetForProfile(profile).Manager, before, applyCVars, func(settings launcher.GameSettings, language string) {
+		addToApplications := func() error { return launcher.InstallApplicationShortcut(launcherPath, launcherMark) }
+		showSettings(w, tr, game.Selected, original.LauncherLanguage, original.LaunchTargetForProfile(profile).Manager, before, cvarsFor(profile, selectedRoot()), addToApplications, func(settings launcher.GameSettings, language string) {
 			mu.Lock()
 			prefs.SetGameSettingsForProfile(profile, settings)
 			prefs.LauncherLanguage = language
@@ -2126,15 +2216,11 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	homeAddonStatus.Truncation = fyne.TextTruncateEllipsis
 	homeAddonStatus.Importance = widget.LowImportance
 	addonRow := container.NewBorder(nil, nil, container.NewCenter(headingText(tr("Add-ons"), 16)), addonManageButton)
-	supportCard := card(container.NewVBox(addonRow, flushText(homeAddonStatus)))
-	newsView, newsPreview, loadNews := newNewsView(windowCtx, tr, fetchNews, func() { switchScreen("news") })
-	newsPreviewWidth := canvas.NewRectangle(color.Transparent)
-	newsPreviewWidth.SetMinSize(fyne.NewSize(324, 0))
-	bottomLeft := container.NewBorder(nil, container.NewStack(newsPreviewWidth, card(newsPreview)), nil, nil)
+	supportCard := card(container.NewVBox(addonRow, flushText(homeAddonStatus), widget.NewSeparator(), container.NewHBox(newTroubleshootButton())))
+	newsView, newsPreview, loadNews := newNewsView(windowCtx, tr, fetchNews, func() { switchScreen("news") }, func() { homeScroll.Refresh() })
 	homeCards := container.New(layout.NewCustomPaddedVBoxLayout(8), primaryCard, layout.NewSpacer(), supportCard)
-	homeRail = container.NewVScroll(homeCards)
-	homeRail.SetMinSize(fyne.NewSize(440, 0))
-	home := container.NewBorder(nil, nil, bottomLeft, homeRail)
+	homeScroll = container.NewVScroll(nil)
+	homeScroll.Content = container.New(homeLayout{viewport: homeScroll}, card(newsPreview), homeCards)
 	updateFiles = newUpdateFilePane(w, tr, card)
 	updateActivityButton = widget.NewButton(tr("Update files"), func() { updateFilesOnly(false) })
 	verifyActivityButton = widget.NewButton(tr("Verify files"), func() { updateFilesOnly(true) })
@@ -2155,7 +2241,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	refreshUpdateUI()
 	const screenInset = 22
 	screenPadding := layout.NewCustomPaddedLayout(18, 18, screenInset, screenInset)
-	homeView := container.New(screenPadding, home)
+	homeView := container.New(screenPadding, homeScroll)
 	updateScreen := container.New(screenPadding, updateView)
 	setupScreen := container.New(screenPadding, setupView)
 	addonsScreen := container.New(screenPadding, addonScreen)
@@ -2186,8 +2272,17 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		if name == "addons" {
 			refreshAddons()
 		}
+		if name == "home" || name == "setup" {
+			if name == "setup" && setupStep != 1 && selectedGame() == "roguelike" && setupFolderMissing(selectedRoot()) {
+				setSetupStep(1)
+			} else {
+				refreshSetup()
+			}
+		}
 		if name == "home" {
 			dimWallpaper.Hide()
+			profileHint.SetText(profileHintText(selectedGame()))
+			homeScroll.ScrollToTop()
 		} else {
 			dimWallpaper.Show()
 		}
@@ -2232,20 +2327,41 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	rule.SetMinSize(fyne.NewSize(1, 1))
 	topbar := container.NewStack(canvas.NewRectangle(hexColor(colorRail)), container.NewBorder(nil, rule, nil, nil, bar))
 	background := container.NewStack(canvas.NewRectangle(hexColor(colorBG)), launcherBackdrop(), dimWallpaper)
-	w.SetContent(container.NewBorder(topbar, nil, nil, nil, background, screenStack))
+	copyActivity := wrappedLabel("")
+	copyActivity.TextStyle.Bold = true
+	copyProgress := widget.NewProgressBarInfinite()
+	meter := container.NewGridWrap(fyne.NewSize(152, copyProgress.MinSize().Height), copyProgress)
+	copyProgress.Stop()
+	copyBanner := container.NewStack(canvas.NewRectangle(hexColor(colorRail)),
+		container.New(layout.NewCustomPaddedLayout(2, 6, screenInset, screenInset),
+			container.NewBorder(nil, nil, nil, meter, copyActivity)))
+	copyBanner.Hide()
+	content := container.NewBorder(container.New(layout.NewCustomPaddedVBoxLayout(0), topbar, copyBanner), nil, nil, nil, background, screenStack)
+	w.SetContent(content)
+	setCopyActivity = func(message string) {
+		copyInProgress = message != ""
+		if copyInProgress {
+			setupNotice.SetText("")
+			copyActivity.SetText(tr(message))
+			copyBanner.Show()
+			copyProgress.Start()
+		} else {
+			copyProgress.Stop()
+			copyBanner.Hide()
+		}
+		content.Refresh()
+		refreshSetup()
+	}
 	switchScreen("home")
 	migrateSavedPasswords(prefs.ProductionRoot, prefs.PTRRoot)
 	loadNews()
-	if notice == "" && strings.TrimSpace(prefs.RootForProfile(prefs.GameSlug)) == "" {
-		if prefs.GameSlug == "roguelike" && prefs.ProductionRoot != "" {
-			switchScreen("setup")
-		} else {
-			findGameFolder()
-		}
+	if notice == "" && setupFolderMissing(prefs.RootForProfile(prefs.GameSlug)) {
+		switchScreen("setup")
 	}
 	refreshServerStatus()
 	return func() {
 		cancelWindow()
+		copyProgress.Stop()
 		copyWork.Wait()
 	}
 }
