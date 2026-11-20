@@ -1,5 +1,7 @@
 .updaterToken
 .ebonhold-token-*
+.ebonhold-credential-*
+.ebonhold-saved-login
 .ebonhold-login/
 /.launcher-update.lock
 /Interface/AddOns/.ebonhold-launcher.lock

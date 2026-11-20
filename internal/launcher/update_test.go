@@ -522,10 +522,28 @@ func TestUpdaterRefreshesOnceAndBoundsRenewed401(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsRememberedLoginAsGameFile(t *testing.T) {
+	api := &updaterAPI{}
+	root, updater := setupUpdater(t, api)
+	path := filepath.Join(root, savedLoginFile)
+	const original = `{"username":"example","password":"synthetic-test-secret"}`
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest(nil, game(file("1", savedLoginFile, []byte("not a game file"), nil)))
+	if _, err := updater.Run(t.Context(), m, "token", UpdateOptions{GameSlug: "retail"}, nil); err == nil ||
+		!strings.Contains(err.Error(), "reserved for launcher sign-in") {
+		t.Fatalf("updater accepted a launcher credential as a game file: %v", err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != original {
+		t.Fatal("update changed the saved launcher sign-in")
+	}
+}
+
 type promptStub struct{}
 
-func (promptStub) PromptLogin(context.Context) (string, string, error) {
-	return "u", "p", nil
+func (promptStub) PromptLogin(context.Context, bool) (LoginCredentials, error) {
+	return LoginCredentials{Username: "u", Password: "p"}, nil
 }
 
 func TestUpdaterRealmlistAndCacheAfterSuccess(t *testing.T) {

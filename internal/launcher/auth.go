@@ -19,6 +19,8 @@ const legacyPasswordFile = "credentials.json"
 
 const tokenFile = ".updaterToken"
 
+const RememberPasswordWarning = "Your password is encrypted with a key kept outside the game folder. Apps running as you or anyone with both files can still read it. Leave this off on shared computers."
+
 func (s *CredentialStore) Token() (string, error) {
 	install, err := openInstallation(s.Root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -36,27 +38,60 @@ func (s *CredentialStore) Token() (string, error) {
 	return readToken(dir)
 }
 
+// HasSavedSignIn checks whether there are local credentials to clear, even if
+// the token has expired or the saved password can't be read.
+func (s *CredentialStore) HasSavedSignIn() bool {
+	install, err := openInstallation(s.Root)
+	if err != nil {
+		return false
+	}
+	defer install.Close()
+	for _, name := range [...]string{tokenFile, savedLoginFile} {
+		if _, err := install.Lstat(name); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func openPrivateCredential(dir *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	if err := checkPrivateCredential(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func checkPrivateCredential(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return validatePrivateCredential(info)
+}
+
+func validatePrivateCredential(info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm() != 0600 || !ok || stat.Nlink != 1 {
+		return errors.New("credential must be a regular, unlinked file owned by you with mode 0600")
+	}
+	return nil
+}
+
 func readToken(dir *os.File) (string, error) {
-	fd, err := unix.Openat(int(dir.Fd()), tokenFile, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	f, err := openPrivateCredential(dir, tokenFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	f := os.NewFile(uintptr(fd), tokenFile)
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() || !ownedByCurrentUser(info) || info.Mode().Perm() != 0600 {
-		return "", errors.New("cached token file is unsafe")
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Nlink != 1 {
-		return "", errors.New("cached token file has hard links")
-	}
 	b, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
@@ -79,26 +114,28 @@ func requirePrivateInstallation(install *os.Root) error {
 	return nil
 }
 
-func saveToken(install *os.Root, token string) error {
+func writePrivateCredential(install *os.Root, name string, write func(io.Writer) error) error {
 	if err := requirePrivateInstallation(install); err != nil {
 		return err
 	}
-	if info, err := install.Lstat(tokenFile); err == nil {
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) || !ok || st.Nlink != 1 {
-			return errors.New("credential destination is unsafe")
+	if info, err := install.Lstat(name); err == nil {
+		if err := validatePrivateCredential(info); err != nil {
+			return err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return errors.New("could not inspect credential destination")
 	}
-	tmp := ".ebonhold-token-" + rand.Text()
+	tmp := ".ebonhold-credential-" + rand.Text()
 	f, err := install.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return errors.New("could not create private credential")
 	}
 	defer install.Remove(tmp)
 	if err = f.Chmod(0600); err == nil {
-		_, err = f.WriteString(token)
+		err = checkPrivateCredential(f)
+	}
+	if err == nil {
+		err = write(f)
 	}
 	if err == nil {
 		err = f.Sync()
@@ -109,10 +146,18 @@ func saveToken(install *os.Root, token string) error {
 	if err != nil {
 		return errors.New("could not write private credential")
 	}
-	if err = install.Rename(tmp, tokenFile); err != nil {
+	if err = install.Rename(tmp, name); err != nil {
 		return errors.New("could not replace private credential")
 	}
 	return nil
+}
+
+func unlinkCredential(dir *os.File, name string) error {
+	err := unix.Unlinkat(int(dir.Fd()), name, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // RemoveLegacyPassword removes an old password from a valid game folder without reading it.
@@ -200,7 +245,7 @@ func lockAuthentication(install *os.Root) (*os.File, error) {
 	}
 	if err := unix.Flock(int(dir.Fd()), unix.LOCK_EX); err != nil {
 		dir.Close()
-		return nil, fmt.Errorf("could not lock game folder for authentication: %w", err)
+		return nil, fmt.Errorf("could not lock authentication directory: %w", err)
 	}
 	return dir, nil
 }
@@ -248,27 +293,71 @@ func (a *Authenticator) authenticate(ctx context.Context, relogin, force bool) (
 	if a.Prompt == nil {
 		return "", Manifest{}, errors.New("interactive sign-in is unavailable")
 	}
-	user, pass, err := a.Prompt.PromptLogin(ctx)
+	if !relogin {
+		saved, err := readSavedLogin(install, dir)
+		if err != nil {
+			a.warn("Could not read the saved launcher password. Sign out on Home to remove it.")
+		} else if saved.Username != "" {
+			token, manifest, err := a.signIn(ctx, install, saved)
+			if !errors.Is(err, errSignInFailed) {
+				return token, manifest, err
+			}
+		}
+	}
+	login, err := a.Prompt.PromptLogin(ctx, !a.ReadOnly)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return "", Manifest{}, err
 		}
 		return "", Manifest{}, errors.New("could not prompt for sign-in")
 	}
-	token, err := a.API.Login(ctx, user, pass)
+	token, manifest, err := a.signIn(ctx, install, login)
+	if err != nil || a.ReadOnly {
+		return token, manifest, err
+	}
+	if login.Remember {
+		if err := saveLogin(install, login); err != nil {
+			a.warn("Could not save the launcher password. Your session is still signed in.")
+		}
+	} else if err := unlinkCredential(dir, savedLoginFile); err != nil {
+		a.warn("Could not remove the previous launcher password. Sign out on Home to try again.")
+	}
+	return token, manifest, nil
+}
+
+var errSignInFailed = errors.New("sign-in failed")
+
+func (a *Authenticator) signIn(ctx context.Context, install *os.Root, login LoginCredentials) (string, Manifest, error) {
+	if err := ctx.Err(); err != nil {
+		return "", Manifest{}, err
+	}
+	token, err := a.API.Login(ctx, login.Username, login.Password)
 	if err != nil {
-		return "", Manifest{}, errors.New("sign-in failed")
+		if ctx.Err() != nil {
+			return "", Manifest{}, ctx.Err()
+		}
+		return "", Manifest{}, errSignInFailed
 	}
 	m, err := a.API.Games(ctx, token)
 	if err != nil {
 		return "", Manifest{}, errors.New("could not load manifest after sign-in")
 	}
 	if !a.ReadOnly {
-		if err := saveToken(install, token); err != nil {
+		if err := writePrivateCredential(install, tokenFile, func(w io.Writer) error {
+			_, err := io.WriteString(w, token)
+			return err
+		}); err != nil {
 			return "", Manifest{}, fmt.Errorf("could not save authentication token: %w", err)
 		}
 	}
 	return token, m, nil
+}
+
+func (a *Authenticator) warn(message string) {
+	if a.Warning != "" {
+		a.Warning += "\n\n"
+	}
+	a.Warning += message
 }
 
 func unauthorized(err error) bool {
@@ -294,8 +383,10 @@ func (a *Authenticator) Forget() error {
 		return err
 	}
 	var failures []error
-	if err := unix.Unlinkat(int(dir.Fd()), tokenFile, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
-		failures = append(failures, fmt.Errorf("remove cached token: %w", err))
+	for _, name := range [...]string{tokenFile, savedLoginFile} {
+		if err := unlinkCredential(dir, name); err != nil {
+			failures = append(failures, fmt.Errorf("remove %s: %w", name, err))
+		}
 	}
 	if err := removeLegacyPassword(install, false); err != nil {
 		failures = append(failures, fmt.Errorf("could not remove the old saved password: %w", err))

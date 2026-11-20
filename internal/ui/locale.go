@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"strings"
+
+	"github.com/synthtrash/ebonhold-linux-patcher/internal/launcher"
 )
 
 type translate func(string, ...any) string
@@ -123,7 +125,18 @@ var frenchText = map[string]string{
 	"Signed in":           "Vous êtes connecté",
 
 	"Use your Project Ebonhold account to update files.": "Utilisez votre compte Project Ebonhold pour mettre les fichiers à jour.",
-	"This signs you in for updates and add-ons. In WoW, select Remember Account Name to save only the name. Anyone who can read that game folder can see it. Leave this off on shared computers.": "Cette connexion sert aux mises à jour et aux extensions. Dans WoW, cochez l’option de mémorisation pour enregistrer uniquement le nom du compte. Toute personne ayant accès au dossier du jeu peut le lire. Laissez cette option désactivée sur un ordinateur partagé.",
+	"This signs you in for updates and add-ons. Sign in to WoW separately.": "Cette connexion sert aux mises à jour et aux extensions. Connectez-vous séparément dans WoW.",
+	"Remember launcher password":                       "Mémoriser le mot de passe du lanceur",
+	launcher.RememberPasswordWarning: "Votre mot de passe est chiffré avec une clé stockée en dehors du dossier du jeu. Les applications lancées sous votre compte peuvent toujours le lire, tout comme une personne qui possède les deux fichiers. Ne cochez pas cette case sur un ordinateur partagé.",
+	"Sign out…":                 "Se déconnecter…",
+	"Sign out":                  "Se déconnecter",
+	"Sign out of the launcher?": "Se déconnecter du lanceur ?",
+	"This clears the session and any saved password for %s. It won't sign you out of WoW.": "Profil : %s. La session et le mot de passe enregistré seront effacés sur cet ordinateur. Vous resterez connecté à WoW.",
+	"Could not sign out":         "Impossible de se déconnecter",
+	"Signed out of the launcher.": "Vous êtes déconnecté du lanceur.",
+	"Could not read the saved launcher password. Sign out on Home to remove it.": "Impossible de lire le mot de passe enregistré. Déconnectez-vous depuis l’accueil pour le supprimer.",
+	"Could not save the launcher password. Your session is still signed in.":  "Impossible d’enregistrer le mot de passe du lanceur. Vous êtes toujours connecté.",
+	"Could not remove the previous launcher password. Sign out on Home to try again.": "Impossible de supprimer l’ancien mot de passe du lanceur. Déconnectez-vous depuis l’accueil pour réessayer.",
 	"Sign in to check for updates.":                      "Connectez-vous pour rechercher les mises à jour.",
 
 	"News":                        "Actualités",
@@ -270,14 +283,13 @@ var frenchText = map[string]string{
 	"VERIFICATION NEEDS ATTENTION":          "ANOMALIES DÉTECTÉES",
 	"FILES VERIFIED":                        "FICHIERS VÉRIFIÉS",
 	"UPDATE COMPLETE":                       "MISE À JOUR TERMINÉE",
-	"CLIENT UP TO DATE":                     "JEU À JOUR",
 	"Update before playing":                 "Mettez le jeu à jour avant de jouer",
 	"Updating Ebonhold":                     "Mise à jour d’Ebonhold",
 	"Update complete":                       "Mise à jour terminée",
 	"Some files need repair":                "Des fichiers doivent être réparés",
 	"Retry the update":                      "Relancer la mise à jour",
 	"Your game files are ready":             "Vos fichiers de jeu sont prêts",
-	"Your game files are up to date":        "Vos fichiers de jeu sont à jour",
+	"Game files up to date":                 "Jeu à jour",
 	"Update files":                          "Mettre à jour",
 	"Install PTR":                           "Installer le PTR",
 	"Retry update":                          "Réessayer",
@@ -327,6 +339,7 @@ var frenchText = map[string]string{
 	"Verifying game files":                                           "Vérification des fichiers du jeu",
 	"%d files affected":                                             "Fichiers concernés : %d",
 	"Verification complete · checked %d, missing %d, mismatched %d": "Vérification terminée. Fichiers contrôlés : %d · Manquants : %d · Autres anomalies : %d",
+	"Files checked: %d":                                             "Fichiers contrôlés : %d",
 	"Update complete · downloaded %d files":                         "Mise à jour terminée · Fichiers téléchargés : %d",
 	"Server status unknown":                                         "État du serveur inconnu",
 	"Checking shared server status…":                               "Vérification du serveur…",
@@ -410,7 +423,6 @@ var frenchText = map[string]string{
 	"On Home, sign in if asked and choose Install PTR.":                   "Dans « Accueil », connectez-vous si nécessaire, puis cliquez sur « Installer le PTR ».",
 	"Files checked: %d · Missing: %d · Other issues: %d. Select a file on Update for the next step.": "Fichiers contrôlés : %d · Manquants : %d · Autres anomalies : %d. Dans « Mise à jour », sélectionnez un fichier pour savoir quoi faire.",
 	"Verification checked %d files; all matched the selected profile.":                             "Fichiers contrôlés : %d. Tous sont conformes au profil sélectionné.",
-	"No files needed updating.":                                                   "Aucun fichier à mettre à jour.",
 	"Files downloaded: %d":                                              "Fichiers téléchargés : %d",
 	"Choose and confirm your game folder in Setup first.":                   "Dans Configuration, choisissez puis confirmez le dossier du jeu.",
 	"Update available":                  "Mise à jour disponible",

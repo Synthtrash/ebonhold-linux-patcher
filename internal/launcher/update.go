@@ -325,6 +325,10 @@ func (u *Updater) validateFiles(files []ManifestFile) error {
 		if err != nil {
 			return fmt.Errorf("unsafe manifest path %q", f.Path)
 		}
+		top, _, _ := strings.Cut(clean, "/")
+		if strings.EqualFold(top, savedLoginFile) || strings.EqualFold(top, tokenFile) {
+			return fmt.Errorf("manifest path %q is reserved for launcher sign-in", f.Path)
+		}
 		if _, err := u.destination(clean); err != nil {
 			return err
 		}

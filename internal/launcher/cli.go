@@ -199,8 +199,8 @@ Options:
   --hd-creatures     Enable manifest-provided creature HD files
   --option=SLUG      Select an exact manifest option slug
   --quiet            Suppress routine output; warnings and errors remain
-  --relogin         Ignore cached login and request fresh credentials
-  --forget-login    Remove this installation's cached token and any old saved password
+  --relogin         Ignore cached and remembered sign-in and ask for credentials
+  --forget-login    Remove this installation's cached token and saved password
   --version          Show the launcher build version and exit
   --help            Show this help
 
@@ -222,17 +222,17 @@ func NewConsole(in io.Reader, out, errOut io.Writer, terminal, graphical bool) *
 	return &Console{In: in, Out: out, Err: errOut, Terminal: terminal, Graphical: graphical, reader: bufio.NewReader(in)}
 }
 
-func (c *Console) PromptLogin(ctx context.Context) (string, string, error) {
+func (c *Console) PromptLogin(ctx context.Context, allowRemember bool) (LoginCredentials, error) {
 	if !c.Terminal && c.Graphical {
-		return c.promptZenity(ctx)
+		return c.promptZenity(ctx, allowRemember)
 	}
 	if !c.Terminal {
-		return "", "", errors.New("no interactive sign-in is available; run the launcher once from a terminal or desktop")
+		return LoginCredentials{}, errors.New("no interactive sign-in is available; run the launcher once from a terminal or desktop")
 	}
 	fmt.Fprint(c.Err, "Ebonhold username: ")
 	username, err := c.readLine()
 	if err != nil || strings.TrimSpace(username) == "" {
-		return "", "", errors.New("username was not provided")
+		return LoginCredentials{}, errors.New("username was not provided")
 	}
 	fmt.Fprint(c.Err, "Ebonhold password: ")
 	var password string
@@ -240,37 +240,50 @@ func (c *Console) PromptLogin(ctx context.Context) (string, string, error) {
 		secret, err := term.ReadPassword(int(file.Fd()))
 		fmt.Fprintln(c.Err)
 		if err != nil {
-			return "", "", errors.New("could not read password")
+			return LoginCredentials{}, errors.New("could not read password")
 		}
 		password = string(secret)
 	} else {
 		password, err = c.readLine()
 		if err != nil {
-			return "", "", errors.New("could not read password")
+			return LoginCredentials{}, errors.New("could not read password")
 		}
 	}
 	if password == "" {
-		return "", "", errors.New("password was not provided")
+		return LoginCredentials{}, errors.New("password was not provided")
 	}
-	return username, password, nil
+	login := LoginCredentials{Username: username, Password: password}
+	if allowRemember {
+		fmt.Fprintf(c.Err, "%s\nRemember launcher password? [y/N] ", RememberPasswordWarning)
+		choice, _ := c.readLine()
+		choice = strings.TrimSpace(choice)
+		login.Remember = strings.EqualFold(choice, "y") || strings.EqualFold(choice, "yes")
+	}
+	return login, nil
 }
 
-func (c *Console) promptZenity(ctx context.Context) (string, string, error) {
+func (c *Console) promptZenity(ctx context.Context, allowRemember bool) (LoginCredentials, error) {
 	if _, err := exec.LookPath("zenity"); err != nil {
-		return "", "", errors.New("graphical sign-in needs Zenity; install it or run the launcher from a terminal")
+		return LoginCredentials{}, errors.New("graphical sign-in needs Zenity; install it or run the launcher from a terminal")
 	}
 	username, err := exec.CommandContext(ctx, "zenity", "--entry", "--title=Ebonhold Login", "--text=Sign in to Project Ebonhold").Output()
 	if err != nil {
-		return "", "", errors.New("sign-in was cancelled")
+		return LoginCredentials{}, context.Canceled
 	}
 	password, err := exec.CommandContext(ctx, "zenity", "--password", "--title=Ebonhold Login", "--text=Enter your password").Output()
 	if err != nil {
-		return "", "", errors.New("sign-in was cancelled")
+		return LoginCredentials{}, context.Canceled
 	}
 	if strings.TrimSpace(string(username)) == "" || len(password) == 0 {
-		return "", "", errors.New("username and password are required")
+		return LoginCredentials{}, errors.New("username and password are required")
 	}
-	return strings.TrimSpace(string(username)), strings.TrimRight(string(password), "\r\n"), nil
+	login := LoginCredentials{Username: strings.TrimSpace(string(username)), Password: strings.TrimRight(string(password), "\r\n")}
+	if allowRemember {
+		login.Remember = exec.CommandContext(ctx, "zenity", "--question", "--no-markup", "--default-cancel",
+			"--title=Ebonhold Login", "--ok-label=Remember password", "--cancel-label=Don't save",
+			"--text="+RememberPasswordWarning).Run() == nil
+	}
+	return login, nil
 }
 
 func (c *Console) readLine() (string, error) {
@@ -315,7 +328,7 @@ func RunCLI(ctx context.Context, api API, root string, args []string, console *C
 			return fmt.Errorf("could not forget login: %w", err)
 		}
 		if !opts.Quiet {
-			fmt.Fprintln(console.Out, "Removed the cached session and any old saved password for this installation.")
+			fmt.Fprintln(console.Out, "Removed the cached launcher session and saved password for this installation.")
 		}
 		return nil
 	}

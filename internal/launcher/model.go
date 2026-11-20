@@ -84,8 +84,14 @@ type AddonDownload struct {
 	URL      string `json:"url"`
 }
 
+type LoginCredentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Remember bool   `json:"-"`
+}
+
 type LoginPrompt interface {
-	PromptLogin(context.Context) (username, password string, err error)
+	PromptLogin(ctx context.Context, allowRemember bool) (LoginCredentials, error)
 }
 
 type Progress struct {
@@ -103,8 +109,9 @@ type CredentialStore struct {
 }
 
 type Authenticator struct {
-	API      API
-	Store    *CredentialStore
+	API   API
+	Store *CredentialStore
+	// A nil prompt makes background checks use only the cached token.
 	Prompt   LoginPrompt
 	ReadOnly bool
 	Warning  string
