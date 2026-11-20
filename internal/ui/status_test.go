@@ -196,6 +196,12 @@ func openTestWindowWithToken(t *testing.T, api launcher.API, ticks <-chan time.T
 }
 
 func TestHomeSignInRestoresUpdateActions(t *testing.T) {
+	t.Run("session only", func(t *testing.T) { testHomeSignIn(t, false) })
+	t.Run("remembered login without a token", func(t *testing.T) { testHomeSignIn(t, true) })
+}
+
+func testHomeSignIn(t *testing.T, remember bool) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	api := &signInTestAPI{windowTestAPI: &windowTestAPI{statusTestAPI: statusTestAPI{token: "valid-token"}}}
 	w, driver, root := openTestWindowWithToken(t, api, nil, "expired-token", nil)
 	button := func(text string) (*widget.Button, bool) {
@@ -211,6 +217,7 @@ func TestHomeSignInRestoresUpdateActions(t *testing.T) {
 		return b
 	}
 	signIn := waitButton("Sign in")
+	waitButton("Sign out…")
 	for _, label := range []string{"Update files", "Verify files", "Play"} {
 		if _, visible := button(label); visible {
 			t.Fatalf("%q is visible without authentication", label)
@@ -223,6 +230,7 @@ func TestHomeSignInRestoresUpdateActions(t *testing.T) {
 		form, visible = findControl(w.Canvas().Overlays().Top(), func(*widget.Form) bool { return true })
 		return visible
 	})
+	var rememberPassword *widget.Check
 	for _, item := range form.Items {
 		switch item.Text {
 		case "Username":
@@ -230,6 +238,15 @@ func TestHomeSignInRestoresUpdateActions(t *testing.T) {
 		case "Password":
 			item.Widget.(*widget.Entry).SetText("test-password")
 		}
+		if check, ok := item.Widget.(*widget.Check); ok && check.Text == "Remember launcher password" {
+			rememberPassword = check
+		}
+	}
+	if rememberPassword == nil || rememberPassword.Checked {
+		t.Fatal("remember password is missing or opted in by default")
+	}
+	if remember {
+		test.Tap(rememberPassword)
 	}
 	confirm, ok := findControl(w.Canvas().Overlays().Top(), func(button *widget.Button) bool { return button.Text == "Sign in" })
 	if !ok {
@@ -258,13 +275,67 @@ func TestHomeSignInRestoresUpdateActions(t *testing.T) {
 	}
 	profile.SetSelected("Public test realm (PTR)")
 	waitButton("Sign in")
-	if _, visible := button("Update files"); visible {
-		t.Fatal("PTR inherited the Production session")
+	for _, label := range []string{"Update files", "Sign out…"} {
+		if _, visible := button(label); visible {
+			t.Fatalf("PTR inherited %q from Production", label)
+		}
+	}
+	saved := filepath.Join(root, ".ebonhold-saved-login")
+	info, err := os.Stat(saved)
+	tokenPath := filepath.Join(root, ".updaterToken")
+	if remember {
+		if err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("explicit consent did not save an owner-only password: %v", err)
+		}
+		if err := os.Remove(tokenPath); err != nil {
+			t.Fatal(err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sign-in without consent left a saved password: %v", err)
 	}
 	profile.SetSelected("Production realm")
-	waitButton("Update files")
-	if _, visible := button("Sign in"); visible {
-		t.Fatal("switching to PTR forgot the Production session")
+	stored := tokenPath
+	if remember {
+		waitButton("Sign in")
+		stored = saved
+	} else {
+		waitButton("Update files")
+		if _, visible := button("Sign in"); visible {
+			t.Fatal("switching to PTR forgot the Production session")
+		}
+	}
+	store, err := launcher.NewPreferencesStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefs, err := store.Load()
+	if err != nil || !filepath.IsAbs(prefs.PTRRoot) || prefs.PTRRoot == root {
+		t.Fatalf("separate PTR folder was not saved: %v", err)
+	}
+	const ptrToken = "ptr-session"
+	if err := os.WriteFile(filepath.Join(prefs.PTRRoot, ".updaterToken"), []byte(ptrToken), 0600); err != nil {
+		t.Fatal(err)
+	}
+	signOut := waitButton("Sign out…")
+	test.Tap(signOut)
+	tapButton(t, w.Canvas().Overlays().Top(), "Cancel")
+	if _, err := os.Stat(stored); err != nil {
+		t.Fatalf("cancelling sign-out removed the saved login: %v", err)
+	}
+	test.Tap(signOut)
+	tapButton(t, w.Canvas().Overlays().Top(), "Sign out")
+	waitButton("Sign in")
+	if _, visible := button("Sign out…"); visible {
+		t.Fatal("Home still offers sign-out without a saved login")
+	}
+	if _, err := os.Stat(saved); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sign-out left the password in place: %v", err)
+	}
+	if token, err := (&launcher.CredentialStore{Root: root}).Token(); err != nil || token != "" {
+		t.Fatalf("sign-out left a session token: %v", err)
+	}
+	if token, err := (&launcher.CredentialStore{Root: prefs.PTRRoot}).Token(); err != nil || token != ptrToken {
+		t.Fatalf("signing out of Production changed the PTR session: %v", err)
 	}
 }
 

@@ -97,10 +97,10 @@ type loginPrompt struct {
 	tr  translate
 }
 
-func (p loginPrompt) PromptLogin(ctx context.Context) (string, string, error) {
+func (p loginPrompt) PromptLogin(ctx context.Context, allowRemember bool) (launcher.LoginCredentials, error) {
 	type answer struct {
-		user, pass string
-		ok         bool
+		login launcher.LoginCredentials
+		ok    bool
 	}
 	done := make(chan answer, 1)
 	fyne.Do(func() {
@@ -110,27 +110,35 @@ func (p loginPrompt) PromptLogin(ctx context.Context) (string, string, error) {
 		user, pass := widget.NewEntry(), widget.NewPasswordEntry()
 		user.SetPlaceHolder(p.tr("Username"))
 		pass.SetPlaceHolder(p.tr("Password"))
-		note := wrappedLabel(p.tr("This signs you in for updates and add-ons. In WoW, select Remember Account Name to save only the name. Anyone who can read that game folder can see it. Leave this off on shared computers."))
+		note := wrappedLabel(p.tr("This signs you in for updates and add-ons. Sign in to WoW separately."))
 		items := []*widget.FormItem{
 			widget.NewFormItem(p.tr("Username"), user),
 			widget.NewFormItem(p.tr("Password"), pass),
 			widget.NewFormItem("", note),
 		}
+		remember := widget.NewCheck(p.tr("Remember launcher password"), nil)
+		height := float32(265)
+		if allowRemember {
+			warning := wrappedLabel(p.tr(launcher.RememberPasswordWarning))
+			warning.Importance = widget.WarningImportance
+			items = append(items, widget.NewFormItem("", remember), widget.NewFormItem("", warning))
+			height = 385
+		}
 		d := dialog.NewForm(p.tr("Sign in"), p.tr("Sign in"), p.tr("Cancel"), items, func(ok bool) {
-			done <- answer{user: user.Text, pass: pass.Text, ok: ok}
+			done <- answer{login: launcher.LoginCredentials{Username: user.Text, Password: pass.Text, Remember: allowRemember && remember.Checked}, ok: ok}
 		}, p.win)
 		size := p.win.Canvas().Size()
-		d.Resize(fyne.NewSize(min(520, size.Width-32), min(310, size.Height-32)))
+		d.Resize(fyne.NewSize(min(540, size.Width-32), min(height, size.Height-32)))
 		d.Show()
 	})
 	select {
 	case result := <-done:
 		if !result.ok {
-			return "", "", context.Canceled
+			return launcher.LoginCredentials{}, context.Canceled
 		}
-		return result.user, result.pass, nil
+		return result.login, nil
 	case <-ctx.Done():
-		return "", "", ctx.Err()
+		return launcher.LoginCredentials{}, ctx.Err()
 	}
 }
 
@@ -310,7 +318,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	var updateHasRun, updateInProgress, updateFailed, updateVerify bool
 	var copyInProgress bool
 	var setCopyActivity func(string)
-	var playButton, settingsButton, copyPTR, searchFolders *widget.Button
+	var playButton, settingsButton, signOutButton, copyPTR, searchFolders *widget.Button
 	var updateError string
 	resetUpdate := func() {
 		updateHasRun, updateFailed, updateVerify = false, false, false
@@ -1226,6 +1234,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	setAddonBusy = func(busy bool) {
 		addonBusy = busy
 		setEnabled(settingsButton, !busy && !gameActionBusy())
+		setEnabled(signOutButton, !busy && !gameActionBusy())
 		if busy {
 			addonSelection.Disable()
 			loadCatalog.Disable()
@@ -1881,6 +1890,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	homeHeading.Wrapping = fyne.TextWrapWord
 	homeDescription := widget.NewLabel("")
 	homeDescription.Wrapping = fyne.TextWrapWord
+	homeDescriptionRow := flushText(homeDescription)
 	activityHeading := widget.NewLabelWithStyle(tr("Update available"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	activityHeading.Wrapping = fyne.TextWrapWord
 	activityRealm := widget.NewLabel(game.Selected)
@@ -2045,6 +2055,15 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		if settingsButton != nil {
 			setEnabled(settingsButton, !busy && !addonBusy)
 		}
+		if signOutButton != nil {
+			store := launcher.CredentialStore{Root: rootPath}
+			if rootPath != "" && store.HasSavedSignIn() {
+				signOutButton.Show()
+			} else {
+				signOutButton.Hide()
+			}
+			setEnabled(signOutButton, !busy && !addonBusy)
+		}
 		if clientReady && canPlay && !ptrNeedsInstall && (!waitingForSignIn || !updateBeforePlay) {
 			playButton.Show()
 		} else {
@@ -2155,6 +2174,42 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 	profileHint.Wrapping = fyne.TextWrapWord
 	profileHint.Importance = widget.LowImportance
 	profileSelect := container.NewGridWrap(fyne.NewSize(232, homeGame.MinSize().Height), homeGame)
+	signOutButton = widget.NewButton(tr("Sign out…"), func() {
+		if gameActionBusy() || addonBusy {
+			return
+		}
+		rootPath, err := clientRoot()
+		if err != nil {
+			showErr(tr("Choose a client folder"), err)
+			return
+		}
+		message := wrappedLabel(tr("This clears the session and any saved password for %s. It won't sign you out of WoW.", game.Selected))
+		d := dialog.NewCustomConfirm(tr("Sign out of the launcher?"), tr("Sign out"), tr("Cancel"), message, func(ok bool) {
+			if !ok || gameActionBusy() || addonBusy {
+				return
+			}
+			signingIn = true
+			refreshSetup()
+			async(func(ctx context.Context) {
+				err := (&launcher.Authenticator{Store: &launcher.CredentialStore{Root: rootPath}}).Forget()
+				if ctx.Err() != nil {
+					return
+				}
+				post(func() {
+					signingIn = false
+					clientTargetChanged()
+					if err != nil {
+						showDetails(tr("Could not sign out"), err.Error())
+					} else {
+						status.SetText(tr("Signed out of the launcher."))
+					}
+				})
+			})
+		}, w)
+		d.Resize(fyne.NewSize(min(480, w.Canvas().Size().Width-32), 170))
+		d.Show()
+	})
+	signOutButton.Importance = widget.LowImportance
 	settingsButton = widget.NewButtonWithIcon(tr("Settings"), theme.SettingsIcon(), func() {
 		mu.Lock()
 		profile := prefs.GameSlug
@@ -2203,8 +2258,8 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		flushText(profileHint),
 		widget.NewSeparator(),
 		updateState,
-		flushText(homeHeading),
-		flushText(homeDescription),
+		container.NewBorder(nil, nil, nil, signOutButton, flushText(homeHeading)),
+		homeDescriptionRow,
 		signInButton,
 		playButton,
 		launchRow,

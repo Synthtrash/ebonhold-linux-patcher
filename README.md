@@ -110,15 +110,19 @@ Keep any game arguments after a second `--`, following the `Wow.exe` path. If yo
 
 ## Sign-in and local files
 
-Launcher sign-in is for updates and add-ons. The launcher saves a session token in `.updaterToken`, not your password. WoW has its own login screen, so sign in there separately. If the launcher token expires, sign in to the launcher again.
+Launcher sign-in is for updates and add-ons. By default, only the session token is saved in `.updaterToken`. If it expires, sign in again.
+
+**Remember launcher password** is off by default. If enabled, the launcher encrypts your username and password in `.ebonhold-saved-login` and uses them to renew expired sessions. The key is stored separately in `${XDG_STATE_HOME:-$HOME/.local/state}/ebonhold-launcher/.ebonhold-credential-key`. Both files are owner-only (`0600`). No keyring is required.
+
+A copy of the game folder alone can't reveal your saved password, but it can contain a still-valid `.updaterToken`. Apps running under your Linux account or anyone who gets both the encrypted login and its key can still read the password. Leave this off on shared computers. Don't share the token or saved login file.
+
+Choose **Sign out…** on **Home** to clear the launcher session and any saved password for the selected profile. This doesn't sign you out of WoW. From a terminal, use `--client-dir=/path/to/Ebonhold --forget-login`. To start remembering your password, sign out, sign back in, and tick **Remember launcher password**.
+
+`--relogin` asks for credentials without using the previous token or password. Declining to remember a successful new sign-in removes the previous saved password. Verify and dry-run can use a saved password but do not change saved credentials.
 
 To save only your account name, select **Remember Account Name** in WoW. Anyone who can read the game folder can see the name, so leave it off on shared computers. To clear the name, uncheck it and sign in to WoW again.
 
-The desktop launcher removes old `.ebonhold-login/credentials.json` files from valid saved game folders and when you confirm a folder in Setup. It warns if it can't check a saved folder or safely remove an old password. The command line checks for the file before reusing your token, including when reporting status or add-ons. Verify and dry-run leave it alone.
-
-To sign out locally, run the launcher with `--client-dir` and `--forget-login`. This removes the cached session and any old saved password file without contacting the server. The launcher does not read or remove entries in your desktop password wallet.
-
-If cleanup fails, check that `.ebonhold-login` and `credentials.json` are inside the intended game folder and neither is a symlink before removing the old file manually. `--forget-login` reports paths it can't safely clean up.
+Older `.ebonhold-login/credentials.json` files are checked for safe removal, never imported. The launcher does not read or remove entries in your desktop password wallet. If legacy cleanup fails, check that both the directory and file are inside the intended game folder and neither is a symlink before removing the file manually.
 
 ## Build from source
 

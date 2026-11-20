@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -20,10 +21,12 @@ type authFake struct {
 	gamesErr   map[string]error
 	loginCalls int
 	gamesCalls int
+	lastLogin  LoginCredentials
 }
 
-func (f *authFake) Login(context.Context, string, string) (string, error) {
+func (f *authFake) Login(_ context.Context, username, password string) (string, error) {
 	f.loginCalls++
+	f.lastLogin = LoginCredentials{Username: username, Password: password}
 	if f.loginErr != nil && f.loginCalls == 1 {
 		return f.loginToken, f.loginErr
 	}
@@ -42,12 +45,15 @@ func (*authFake) AddonDownloads(context.Context, string, []int64) ([]AddonDownlo
 func (*authFake) Download(context.Context, string, io.Writer) error { return nil }
 
 type authPrompt struct {
-	called bool
+	called      bool
+	remember    bool
+	offeredSave bool
 }
 
-func (p *authPrompt) PromptLogin(context.Context) (string, string, error) {
+func (p *authPrompt) PromptLogin(_ context.Context, allowRemember bool) (LoginCredentials, error) {
 	p.called = true
-	return "manual", "password", nil
+	p.offeredSave = allowRemember
+	return LoginCredentials{Username: "manual", Password: "test-manual-secret", Remember: p.remember}, nil
 }
 
 func writeLegacyPassword(t *testing.T, root string) string {
@@ -99,17 +105,20 @@ func TestAuthenticateReadOnlyLeavesSavedFilesAlone(t *testing.T) {
 	s := &CredentialStore{Root: t.TempDir()}
 	path := writeLegacyPassword(t, s.Root)
 	seedToken(t, s.Root, "expired")
-	prompt := &authPrompt{}
+	prompt := &authPrompt{remember: true}
 	api := &authFake{loginToken: "new", gamesErr: map[string]error{"expired": &HTTPError{StatusCode: http.StatusUnauthorized}}}
 	token, _, err := (&Authenticator{API: api, Store: s, Prompt: prompt, ReadOnly: true}).Authenticate(context.Background(), false)
-	if err != nil || token != "new" || !prompt.called {
-		t.Fatalf("read-only login: %q, %v, prompted=%t", token, err, prompt.called)
+	if err != nil || token != "new" || !prompt.called || prompt.offeredSave {
+		t.Fatalf("read-only login: %q, %v, prompted=%t, offered save=%t", token, err, prompt.called, prompt.offeredSave)
 	}
 	if cached, err := s.Token(); err != nil || cached != "expired" {
 		t.Fatalf("read-only auth replaced the cached token: %q, %v", cached, err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("read-only auth removed the old password: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Root, savedLoginFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only sign-in wrote a saved password: %v", err)
 	}
 }
 
@@ -129,18 +138,243 @@ func TestAuthenticatePromptsForExpiredSessionAndSavesOnlyToken(t *testing.T) {
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("login left a password file: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(s.Root, savedLoginFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sign-in without consent wrote a saved password: %v", err)
+	}
 }
 
 func TestSignInWithoutManifestDoesNotSaveSession(t *testing.T) {
 	store := &CredentialStore{Root: t.TempDir()}
 	api := &authFake{loginToken: "fresh-token", gamesErr: map[string]error{"fresh-token": &HTTPError{StatusCode: http.StatusServiceUnavailable}}}
 
-	_, _, err := (&Authenticator{API: api, Store: store, Prompt: &authPrompt{}}).Authenticate(context.Background(), false)
+	_, _, err := (&Authenticator{API: api, Store: store, Prompt: &authPrompt{remember: true}}).Authenticate(context.Background(), false)
 	if err == nil {
 		t.Fatal("reported a successful sign-in without the manifest")
 	}
 	if cached, err := store.Token(); err != nil || cached != "" {
 		t.Fatalf("failed sign-in saved a token: %q, %v", cached, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root, savedLoginFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed sign-in wrote a saved password: %v", err)
+	}
+}
+
+func TestRememberedLoginRenewsSessionsAndForgets(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	t.Setenv("XDG_STATE_HOME", state)
+	store := &CredentialStore{Root: root}
+	api := &authFake{
+		loginToken: "first-session",
+		gamesErr:   make(map[string]error),
+	}
+	const password = "synthetic $ p@ssword "
+	var output strings.Builder
+	console := NewConsole(strings.NewReader("example\n"+password+"\nyes\n"), io.Discard, &output, true, false)
+	if err := RunCLI(ctx, api, root, []string{"--status"}, console); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, savedLoginFile)
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 || !ownedByCurrentUser(info) {
+		t.Fatalf("saved credential not owner-only: %v, %v", info, err)
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(stored, []byte(password)) || bytes.Contains(stored, []byte("example")) {
+		t.Fatal("saved login contains plaintext credentials")
+	}
+	keyDir := filepath.Join(state, savedLoginStateDir)
+	keyDirInfo, err := os.Stat(keyDir)
+	if err != nil || keyDirInfo.Mode().Perm() != 0700 || !ownedByCurrentUser(keyDirInfo) {
+		t.Fatalf("key directory not owner-only: %v, %v", keyDirInfo, err)
+	}
+	keyInfo, err := os.Stat(filepath.Join(keyDir, savedLoginKeyFile))
+	if err != nil || keyInfo.Mode().Perm() != 0600 || !ownedByCurrentUser(keyInfo) || keyInfo.Size() != 32 {
+		t.Fatalf("key is not a private 32-byte file: %v, %v", keyInfo, err)
+	}
+	if strings.Contains(output.String(), password) {
+		t.Fatal("the CLI printed the password")
+	}
+
+	api.gamesErr["first-session"] = &HTTPError{StatusCode: http.StatusUnauthorized}
+	api.loginToken = "renewed-session"
+	if _, _, err := (&Authenticator{API: api, Store: store, ReadOnly: true}).Authenticate(ctx, false); err == nil || api.loginCalls != 1 {
+		t.Fatalf("background check used more than the cached token: login calls=%d, err=%v", api.loginCalls, err)
+	}
+	prompt := &authPrompt{}
+	token, _, err := (&Authenticator{API: api, Store: store, Prompt: prompt, ReadOnly: true}).Authenticate(ctx, false)
+	if err != nil || token != "renewed-session" || prompt.called {
+		t.Fatalf("read-only renewal token=%q, prompted=%t, err=%v", token, prompt.called, err)
+	}
+	if cached, err := store.Token(); err != nil || cached != "first-session" {
+		t.Fatalf("read-only renewal rewrote the cache: %q, %v", cached, err)
+	}
+
+	headless := NewConsole(strings.NewReader(""), io.Discard, io.Discard, false, false)
+	if err := RunCLI(ctx, api, root, []string{"--status"}, headless); err != nil {
+		t.Fatal(err)
+	}
+	if api.lastLogin.Username != "example" || api.lastLogin.Password != password || api.loginCalls != 3 {
+		t.Fatal("renewal did not reuse the correct saved credentials exactly once per attempt")
+	}
+	if cached, err := store.Token(); err != nil || cached != "renewed-session" {
+		t.Fatalf("renewed token was not cached: %q, %v", cached, err)
+	}
+	if err := RunCLI(ctx, api, root, []string{"--forget-login"}, headless); err != nil {
+		t.Fatal(err)
+	}
+	if api.loginCalls != 3 {
+		t.Fatal("forgetting the password contacted the login service")
+	}
+	for _, name := range []string{savedLoginFile, tokenFile} {
+		if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remains after forgetting: %v", name, err)
+		}
+	}
+}
+
+func TestRememberedLoginFallsBackWhenItCannotDecrypt(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	store := &CredentialStore{Root: t.TempDir()}
+	login := &Authenticator{API: &authFake{loginToken: "saved-session"}, Store: store, Prompt: &authPrompt{remember: true}}
+	if _, _, err := login.Authenticate(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := os.ReadFile(filepath.Join(store.Root, savedLoginFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"game folder copied without key", "modified ciphertext", "plaintext", "group-readable key"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			data := sealed
+			switch kind {
+			case "game folder copied without key":
+				t.Setenv("XDG_STATE_HOME", t.TempDir())
+			case "modified ciphertext":
+				data = bytes.Clone(sealed)
+				data[len(data)-1] ^= 1
+			case "plaintext":
+				data = []byte(`{"username":"old","password":"synthetic-plaintext"}`)
+			case "group-readable key":
+				path := filepath.Join(state, savedLoginStateDir, savedLoginKeyFile)
+				if err := os.Chmod(path, 0640); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := os.Chmod(path, 0600); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			if err := os.WriteFile(filepath.Join(root, savedLoginFile), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			api := &authFake{loginToken: "manual-session"}
+			prompt := &authPrompt{}
+			a := &Authenticator{API: api, Store: &CredentialStore{Root: root}, Prompt: prompt, ReadOnly: true}
+			token, _, err := a.Authenticate(t.Context(), false)
+			if err != nil || token != "manual-session" || !prompt.called || api.loginCalls != 1 || a.Warning == "" {
+				t.Fatalf("expected one manual sign-in and a saved-login warning: prompt=%t, calls=%d, token=%q, err=%v", prompt.called, api.loginCalls, token, err)
+			}
+			if kind == "game folder copied without key" {
+				if _, err := os.Stat(filepath.Join(os.Getenv("XDG_STATE_HOME"), savedLoginStateDir)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("reading a copied login created launcher state: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRememberedLoginKeepsKeyOutOfGameFolder(t *testing.T) {
+	store := &CredentialStore{Root: t.TempDir()}
+	alias := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(store.Root, alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", alias)
+	a := &Authenticator{API: &authFake{loginToken: "session"}, Store: store, Prompt: &authPrompt{remember: true}}
+	token, _, err := a.Authenticate(t.Context(), false)
+	if err != nil || token != "session" || a.Warning == "" {
+		t.Fatalf("unsafe launcher state should fail to remember but keep the session: token=%q, err=%v", token, err)
+	}
+	for _, name := range []string{savedLoginFile, savedLoginStateDir} {
+		if _, err := os.Lstat(filepath.Join(store.Root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s written to game folder: %v", name, err)
+		}
+	}
+}
+
+func TestRememberedLoginRejectsUnsafeFiles(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	const saved = `{"username":"outside","password":"synthetic-saved-secret"}`
+	for _, kind := range []string{"symlink", "hardlink", "readable by group", "FIFO"} {
+		t.Run(kind, func(t *testing.T) {
+			store := &CredentialStore{Root: t.TempDir()}
+			path := filepath.Join(store.Root, savedLoginFile)
+			outside := filepath.Join(t.TempDir(), "outside")
+			mustWrite(t, outside, []byte(saved))
+			if err := os.Chmod(outside, 0600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			switch kind {
+			case "symlink":
+				err = os.Symlink(outside, path)
+			case "hardlink":
+				err = os.Link(outside, path)
+			case "readable by group":
+				err = os.WriteFile(path, []byte(saved), 0640)
+			case "FIFO":
+				err = unix.Mkfifo(path, 0600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api := &authFake{loginToken: "manual-session"}
+			a := &Authenticator{API: api, Store: store, Prompt: &authPrompt{remember: true}}
+			token, _, err := a.Authenticate(t.Context(), false)
+			if err != nil || token != "manual-session" || api.loginCalls != 1 || api.lastLogin.Username != "manual" {
+				t.Fatalf("unsafe login did not fall back to manual sign-in: token=%q, err=%v", token, err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Fatal("unsafe credential path was changed")
+			}
+			if !strings.Contains(a.Warning, "Could not save the launcher password") {
+				t.Fatal("the user was not told that remembering failed")
+			}
+			if got, err := os.ReadFile(outside); err != nil || string(got) != saved {
+				t.Fatal("an external credential was changed")
+			}
+		})
+	}
+}
+
+func TestReloginWithoutRememberingDiscardsOldPassword(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, savedLoginFile)
+	if err := os.WriteFile(path, []byte(`{"username":"old","password":"synthetic-old-secret"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seedToken(t, root, "old-token")
+	api := &authFake{loginToken: "new-token"}
+	a := &Authenticator{API: api, Store: &CredentialStore{Root: root}, Prompt: &authPrompt{}}
+	token, _, err := a.Authenticate(t.Context(), true)
+	if err != nil || token != "new-token" || api.loginCalls != 1 || api.lastLogin.Username != "manual" {
+		t.Fatalf("relogin did not use the newly entered credentials: token=%q, err=%v", token, err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opting out left the old password: %v", err)
 	}
 }
 
