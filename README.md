@@ -41,7 +41,7 @@ If you move or delete a test copy, reopen **Setup** on that profile. **Create PT
 
 ## Using the launcher
 
-- **Play** skips the desktop launcher's update check by default. Use a Steam or Lutris shortcut without an updater command if you want Play to start the game without checking. **Update files** downloads changes. **Verify files** checks the game files without changing them. Both buttons need your Ebonhold sign-in.
+- **Play** skips the desktop launcher's update check by default. Use a Steam or Lutris shortcut without an updater command if you want Play to start the game without checking. **Update files** downloads changes. If nothing changed, Home shows how many files were checked. **Verify files** checks the game files without changing them. Update and Verify both need your Ebonhold sign-in.
 - If an update fails, select a file in **Update** to see why. **Technical details** lists all failures in one place. Use **Copy details** if you need to share them.
 - Run `--version` to identify the build when reporting a problem. **Copy details** includes the same version.
 - **Add-ons** shows what you can install or update. Removal only affects add-ons installed by this launcher and moves them to a backup.

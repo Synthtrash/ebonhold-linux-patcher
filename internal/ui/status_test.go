@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
@@ -519,6 +520,35 @@ func TestUpdateRejectsPendingCopyUnderWrongProfileBeforeSignIn(t *testing.T) {
 		})
 		return found
 	})
+}
+
+func TestHomeShowsOneUpToDateStatusAfterUpdate(t *testing.T) {
+	hash := md5.Sum([]byte("fixture"))
+	api := &windowTestAPI{statusTestAPI: statusTestAPI{token: "test-session"}}
+	api.manifest = launcher.Manifest{Success: true, Data: launcher.ManifestData{Games: []launcher.Game{{
+		Slug: "roguelike-prod", Files: []launcher.ManifestFile{{ID: "1", Path: "Wow.exe", Hash: base64.StdEncoding.EncodeToString(hash[:])}},
+	}}}}
+	w, driver := openTestWindow(t, api, nil)
+	labelVisible := func(text string) bool {
+		_, found := findControl(w.Content(), func(label *widget.Label) bool { return label.Text == text })
+		return found
+	}
+	driver.until(t, "signed-in update action", func() bool {
+		button, found := findControl(w.Content(), func(b *widget.Button) bool { return b.Text == "Update files" })
+		return found && !button.Disabled()
+	})
+	tapButton(t, w.Content(), "Update files")
+	driver.until(t, "no-change update result", func() bool { return labelVisible("Game files up to date") })
+	tapButton(t, w.Content(), "Home")
+	if !labelVisible("Game files up to date") || !labelVisible("Files checked: 1") {
+		t.Fatal("Home does not show the no-change result and checked count")
+	}
+	if _, visible := findControl(w.Content(), func(text *canvas.Text) bool { return text.Text == "CLIENT UP TO DATE" }); visible {
+		t.Fatal("Home repeats the up-to-date result as a badge")
+	}
+	if labelVisible("No files needed updating.") || labelVisible("Update complete · downloaded 0 files") {
+		t.Fatal("Home repeats the up-to-date result below the heading")
+	}
 }
 
 type rateLimitedDownloadAPI struct{ windowTestAPI }

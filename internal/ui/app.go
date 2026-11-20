@@ -820,10 +820,13 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 					}
 					return
 				}
-				if verify {
+				switch {
+				case verify:
 					status.SetText(tr("Verification complete · checked %d, missing %d, mismatched %d", result.Checked, result.Missing, result.Mismatched))
-				} else {
+				case result.FilesUpdated || result.RealmlistUpdated:
 					status.SetText(tr("Update complete · downloaded %d files", result.Downloaded))
+				default:
+					status.SetText(tr("Files checked: %d", result.Checked))
 				}
 				if afterUpdate != nil && ctx.Err() == nil {
 					afterUpdate()
@@ -1917,6 +1920,7 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 		mu.Unlock()
 		ptrNeedsInstall := clientReady && profile == "roguelike" && launcher.PTRNeedsInstall(rootPath)
 		waitingForSignIn := clientReady && !updateInProgress && (!sessionChecked || signInNeeded)
+		noChanges := false
 		switch {
 		case updateInProgress && updateVerify:
 			updateState.Text, updateState.Color = tr("VERIFICATION IN PROGRESS"), hexColor(colorBlue)
@@ -1972,24 +1976,27 @@ func renderWindow(w fyne.Window, api launcher.API, launcherPath string, prefsSto
 			updateState.Text, updateState.Color = tr("FILES VERIFIED"), hexColor(colorGreen)
 			homeHeading.SetText(tr("Your game files are ready"))
 			homeDescription.SetText(tr("Verification checked %d files; all matched the selected profile.", updateResult.Checked))
-		case updateResult.Downloaded > 0 || updateResult.FilesUpdated:
+		case updateResult.FilesUpdated || updateResult.RealmlistUpdated:
 			updateState.Text, updateState.Color = tr("UPDATE COMPLETE"), hexColor(colorGreen)
 			homeHeading.SetText(tr("Update complete"))
 			homeDescription.SetText(tr("Files downloaded: %d", updateResult.Downloaded))
 		default:
-			updateState.Text, updateState.Color = tr("CLIENT UP TO DATE"), hexColor(colorGreen)
-			homeHeading.SetText(tr("Your game files are up to date"))
-			homeDescription.SetText(tr("No files needed updating."))
+			noChanges = true
+			homeHeading.SetText(tr("Game files up to date"))
+		}
+		if noChanges {
+			homeDescriptionRow.Hide()
+		} else {
+			homeDescriptionRow.Show()
+		}
+		if waitingForSignIn || noChanges || (canPlay && !ptrNeedsInstall && !updateInProgress && !updateHasRun) {
+			updateState.Hide()
+		} else {
+			updateState.Show()
 		}
 		if waitingForSignIn {
-			updateState.Hide()
 			statusRow.Hide()
 		} else {
-			if canPlay && !ptrNeedsInstall && !updateInProgress && !updateHasRun {
-				updateState.Hide()
-			} else {
-				updateState.Show()
-			}
 			statusRow.Show()
 		}
 		if waitingForSignIn && sessionChecked {
